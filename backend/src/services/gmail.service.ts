@@ -255,22 +255,19 @@ export async function fetchNewMessages(
     const after = Math.floor(Date.now() / 1000) - 365 * 24 * 3600;
     const query = `(${ALL_APPLICATIONS_GMAIL_QUERY}) after:${after}`;
 
+    // The cap counts only emails not stored yet; already-stored ones must not use it up,
+    // or a mailbox with 500+ saved job emails never reaches the rest.
+    // shortcut: listing stops after 50 pages (5,000 matches) per sync; raise if a mailbox ever has more
     let pageToken: string | undefined = undefined;
-    do {
-      const remaining = maxResults - messageIds.length;
-      if (remaining <= 0) break;
-
-      const listRes: any = await gmail.users.messages.list({
-        userId: 'me',
-        q: query,
-        maxResults: Math.min(100, remaining),
-        pageToken,
-      });
-
+    let newCount = 0;
+    for (let page = 0; page < 50 && newCount < maxResults; page++) {
+      const listRes: any = await gmail.users.messages.list({ userId: 'me', q: query, maxResults: 100, pageToken });
       const ids: string[] = (listRes.data.messages || []).map((m: any) => m.id!).filter(Boolean);
       messageIds.push(...ids);
+      newCount += skipIds ? ids.filter((id) => !skipIds.has(id)).length : ids.length;
       pageToken = listRes.data.nextPageToken || undefined;
-    } while (pageToken && messageIds.length < maxResults);
+      if (!pageToken) break;
+    }
 
     // Deduplicate message IDs
     messageIds = [...new Set(messageIds)];
