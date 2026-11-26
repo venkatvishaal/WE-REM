@@ -8,6 +8,7 @@ import {
   RefreshCw,
   BriefcaseBusiness,
   Command,
+  ShieldCheck,
 } from 'lucide-react';
 import { api } from '../api/client';
 
@@ -93,6 +94,13 @@ export default function Sidebar({ unreadCount }: SidebarProps) {
           <div className="sidebar-link-content">
             <SettingsIcon size={18} />
             <span>Settings</span>
+          </div>
+        </NavLink>
+
+        <NavLink to="/privacy" className={({ isActive }) => `sidebar-link${isActive ? ' active' : ''}`}>
+          <div className="sidebar-link-content">
+            <ShieldCheck size={18} />
+            <span>Privacy</span>
           </div>
         </NavLink>
 

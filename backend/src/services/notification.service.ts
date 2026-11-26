@@ -1,8 +1,9 @@
-import { dbGet, dbRun, dbAll } from '../db/database';
+import * as crypto from 'crypto';
+import { dbGet, dbRun } from '../db/database';
 import { generateId } from '../utils/crypto';
-import { sendEmail } from './gmail.service';
+import { getSetting, setSetting } from './user.service';
 
-export type NotificationType = 'status_change' | 'action_required' | 'interview' | 'offer' | 'rejection' | 'error' | 'sync';
+export type NotificationType = 'status_change' | 'action_required' | 'interview' | 'offer' | 'rejection' | 'error' | 'sync' | 'sync_quota';
 
 export interface NotificationPayload {
   applicationId?: string;
@@ -12,76 +13,50 @@ export interface NotificationPayload {
   channels?: string[];
 }
 
-function getEnabledChannels(): string[] {
+async function getEnabledChannels(userId: string): Promise<string[]> {
   const channels: string[] = [];
-  const getSetting = (key: string) => (dbGet<{ value: string }>('SELECT value FROM settings WHERE key = ?', [key]))?.value;
-  if (getSetting('notify_in_app') !== 'false') channels.push('in_app');
-  if (getSetting('notify_email') === 'true') channels.push('email');
-  if (getSetting('notify_desktop') !== 'false') channels.push('desktop');
+  if ((await getSetting(userId, 'notify_in_app')) !== 'false') channels.push('in_app');
+  if ((await getSetting(userId, 'notify_desktop')) !== 'false') channels.push('desktop');
   return channels.length > 0 ? channels : ['in_app'];
 }
 
-export async function dispatch(payload: NotificationPayload): Promise<void> {
-  const channels = payload.channels || getEnabledChannels();
-  const now = new Date().toISOString();
-
-  dbRun(
-    `INSERT INTO notifications (id, application_id, type, title, body, channels, read, sent_at)
-     VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
-    [generateId(), payload.applicationId || null, payload.type, payload.title, payload.body, JSON.stringify(channels), now],
+export async function dispatch(userId: string, payload: NotificationPayload): Promise<void> {
+  const channels = payload.channels || (await getEnabledChannels(userId));
+  await dbRun(
+    `INSERT INTO notifications (id, user_id, application_id, type, title, body, channels, read, sent_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+    [generateId(), userId, payload.applicationId || null, payload.type, payload.title, payload.body, JSON.stringify(channels), new Date().toISOString()],
   );
-
-  if (channels.includes('email')) {
-    const emailTo = dbGet<{ value: string }>('SELECT value FROM settings WHERE key = ?', ['notification_email_to'])?.value;
-    if (emailTo) {
-      try { await sendEmail(emailTo, `[Workday Tracker] ${payload.title}`, buildEmailHtml(payload)); }
-      catch (err) { console.error('[Notification] Email send failed:', err); }
-    }
-  }
 }
 
-function buildEmailHtml(payload: NotificationPayload): string {
-  const typeColors: Record<string, string> = {
-    status_change: '#6366f1', interview: '#22c55e', offer: '#f59e0b',
-    rejection: '#ef4444', action_required: '#f97316', error: '#94a3b8', sync: '#6366f1',
-  };
-  const color = typeColors[payload.type] || '#6366f1';
-  return `<!DOCTYPE html><html><body style="font-family:sans-serif;background:#0f0f17;color:#e2e8f0;padding:24px;">
-  <div style="max-width:560px;margin:0 auto;background:#1a1a2e;border-radius:12px;overflow:hidden;border:1px solid #2d2d44;">
-    <div style="background:${color};padding:16px 24px;"><h1 style="margin:0;font-size:18px;color:white;">Workday Tracker</h1></div>
-    <div style="padding:24px;"><h2 style="margin:0 0 12px;font-size:20px;color:#f1f5f9;">${payload.title}</h2>
-    <p style="margin:0;color:#94a3b8;line-height:1.6;">${payload.body}</p></div>
-  </div></body></html>`;
-}
-
-export async function notifyStatusChange(applicationId: string, companyName: string, jobTitle: string, previousStatus: string, newStatus: string): Promise<void> {
+export async function notifyStatusChange(userId: string, applicationId: string, companyName: string, jobTitle: string, previousStatus: string, newStatus: string): Promise<void> {
   const labels: Record<string, string> = {
     applied: 'Applied', acknowledged: 'Acknowledged', under_review: 'Under Review',
     interview: 'Interview', assessment: 'Assessment', offer: 'Offer', rejected: 'Rejected', withdrawn: 'Withdrawn',
   };
   const type: NotificationType = newStatus === 'interview' ? 'interview' : newStatus === 'offer' ? 'offer' : newStatus === 'rejected' ? 'rejection' : 'status_change';
-  await dispatch({ applicationId, type, title: `${companyName} — ${labels[newStatus] || newStatus}`, body: `Your ${jobTitle} application moved: ${labels[previousStatus] || previousStatus} → ${labels[newStatus] || newStatus}.` });
+  await dispatch(userId, { applicationId, type, title: `${companyName} — ${labels[newStatus] || newStatus}`, body: `Your ${jobTitle} application moved: ${labels[previousStatus] || previousStatus} → ${labels[newStatus] || newStatus}.` });
 }
 
-export async function notifyActionRequired(applicationId: string, companyName: string, jobTitle: string, action: string): Promise<void> {
-  await dispatch({ applicationId, type: 'action_required', title: `Action Required — ${companyName}`, body: `${action} for your ${jobTitle} application.` });
+export async function notifyActionRequired(userId: string, applicationId: string, companyName: string, jobTitle: string, action: string): Promise<void> {
+  await dispatch(userId, { applicationId, type: 'action_required', title: `Action Required — ${companyName}`, body: `${action} for your ${jobTitle} application.` });
 }
 
-export async function notifySyncComplete(emailsFetched: number, appsCreated: number, appsUpdated: number): Promise<void> {
+export async function notifySyncComplete(userId: string, emailsFetched: number, appsCreated: number, appsUpdated: number): Promise<void> {
   if (emailsFetched === 0) return;
-  await dispatch({ type: 'sync', title: 'Gmail Sync Complete', body: `Fetched ${emailsFetched} emails. Created ${appsCreated} new applications, updated ${appsUpdated}.`, channels: ['in_app'] });
+  await dispatch(userId, { type: 'sync', title: 'Gmail Sync Complete', body: `Fetched ${emailsFetched} emails. Created ${appsCreated} new applications, updated ${appsUpdated}.`, channels: ['in_app'] });
 }
 
-export async function notifyError(message: string, detail?: string): Promise<void> {
-  await dispatch({ type: 'error', title: 'Sync Error', body: detail ? `${message}: ${detail}` : message, channels: ['in_app'] });
+export async function notifyError(userId: string, message: string, detail?: string): Promise<void> {
+  await dispatch(userId, { type: 'error', title: 'Sync Error', body: detail ? `${message}: ${detail}` : message, channels: ['in_app'] });
 }
 
-// ── Telegram alerts ────────────────────────────────────────────
+// ── Telegram alerts (one shared bot; each user links their own chat) ──
 const TELEGRAM_API = 'https://api.telegram.org/bot';
 
 async function telegramCall(method: string, body?: object): Promise<any> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token) throw new Error('Add TELEGRAM_BOT_TOKEN to backend/.env and restart the backend');
+  if (!token) throw new Error('Telegram alerts are not set up on this server (TELEGRAM_BOT_TOKEN missing)');
   const res = await fetch(`${TELEGRAM_API}${token}/${method}`, {
     method: body ? 'POST' : 'GET',
     headers: body ? { 'Content-Type': 'application/json' } : undefined,
@@ -93,8 +68,8 @@ async function telegramCall(method: string, body?: object): Promise<any> {
   return json.result;
 }
 
-/** Sends to TELEGRAM_CHAT_ID (or `chatId`). Never throws, so a failed alert can't break a Gmail sync. */
-export async function sendTelegram(text: string, chatId = process.env.TELEGRAM_CHAT_ID): Promise<boolean> {
+/** Never throws, so a failed alert can't break a Gmail sync. */
+export async function sendTelegram(text: string, chatId: string | null | undefined): Promise<boolean> {
   if (!process.env.TELEGRAM_BOT_TOKEN || !chatId) return false;
   try {
     await telegramCall('sendMessage', { chat_id: chatId, text });
@@ -105,11 +80,42 @@ export async function sendTelegram(text: string, chatId = process.env.TELEGRAM_C
   }
 }
 
-/** Setup helper: chat ID of the latest message the user sent to the bot. */
-export async function findTelegramChatId(): Promise<string | undefined> {
-  const updates: any[] = await telegramCall('getUpdates');
-  const last = [...updates].reverse().find((u) => u.message?.chat?.id);
-  return last ? String(last.message.chat.id) : undefined;
+async function userChatId(userId: string): Promise<string | null> {
+  return (await dbGet<{ telegram_chat_id: string | null }>('SELECT telegram_chat_id FROM users WHERE id = ?', [userId]))?.telegram_chat_id ?? null;
+}
+
+/** Returns a t.me deep link carrying a one-time code that ties the user's Telegram chat to their account. */
+export async function createTelegramLink(userId: string): Promise<string> {
+  const bot = process.env.TELEGRAM_BOT_USERNAME;
+  if (!process.env.TELEGRAM_BOT_TOKEN || !bot) throw new Error('Telegram alerts are not set up on this server');
+  const code = crypto.randomBytes(16).toString('hex');
+  await dbRun('UPDATE users SET telegram_link_code = ? WHERE id = ?', [code, userId]);
+  return `https://t.me/${bot}?start=${code}`;
+}
+
+/** Handles a Telegram webhook update: "/start <code>" links that chat to the user who made the code. */
+export async function handleTelegramUpdate(update: any): Promise<void> {
+  const text: string = update?.message?.text || '';
+  const chatId = update?.message?.chat?.id;
+  const m = text.match(/^\/start\s+([a-f0-9]{32})$/);
+  if (!m || !chatId) return;
+  const user = await dbGet<{ id: string }>('SELECT id FROM users WHERE telegram_link_code = ?', [m[1]]);
+  if (!user) {
+    await sendTelegram('This link has expired. Open Settings in Job Tracker and click Connect Telegram again.', String(chatId));
+    return;
+  }
+  await dbRun('UPDATE users SET telegram_chat_id = ?, telegram_link_code = NULL WHERE id = ?', [String(chatId), user.id]);
+  await setSetting(user.id, 'notify_telegram', 'true');
+  await sendTelegram('Job Tracker alerts are connected. You will get a message for every new job email.', String(chatId));
+}
+
+export async function disconnectTelegram(userId: string): Promise<void> {
+  await dbRun('UPDATE users SET telegram_chat_id = NULL, telegram_link_code = NULL WHERE id = ?', [userId]);
+  await setSetting(userId, 'notify_telegram', 'false');
+}
+
+export async function sendTelegramTest(userId: string): Promise<boolean> {
+  return sendTelegram('Job Tracker alerts are working', await userChatId(userId));
 }
 
 const ALERT_LABELS: Record<string, string> = {
@@ -134,16 +140,18 @@ export function shouldAlert(receivedAt: string, now = Date.now()): boolean {
   return now - Date.parse(receivedAt) <= ALERT_MAX_AGE_MS;
 }
 
-export async function notifyJobEmail(company: string, jobTitle: string, eventType: string, subject: string, receivedAt: string): Promise<void> {
+export async function notifyJobEmail(userId: string, company: string, jobTitle: string, eventType: string, subject: string, receivedAt: string): Promise<void> {
   if (!shouldAlert(receivedAt)) return;
-  if (dbGet<{ value: string }>('SELECT value FROM settings WHERE key = ?', ['notify_telegram'])?.value !== 'true') return;
-  await sendTelegram(jobAlertText(company, jobTitle, eventType, subject, receivedAt));
+  if ((await getSetting(userId, 'notify_telegram')) !== 'true') return;
+  await sendTelegram(jobAlertText(company, jobTitle, eventType, subject, receivedAt), await userChatId(userId));
 }
 
-export function getUnreadCount(): number {
-  return (dbGet<{ count: number }>('SELECT COUNT(*) as count FROM notifications WHERE read = 0'))?.count ?? 0;
-}
-
-export function markAllRead(): void {
-  dbRun('UPDATE notifications SET read = 1', []);
+/** Gmail access expired (Testing mode does this every 7 days): one in-app note and one Telegram nudge per expiry. */
+export async function notifyReconnectNeeded(userId: string): Promise<void> {
+  const user = await dbGet<{ reconnect_reminded: number; telegram_chat_id: string | null }>(
+    'SELECT reconnect_reminded, telegram_chat_id FROM users WHERE id = ?', [userId]);
+  if (!user || user.reconnect_reminded) return;
+  await dbRun('UPDATE users SET reconnect_reminded = 1 WHERE id = ?', [userId]);
+  await dispatch(userId, { type: 'error', title: 'Reconnect Gmail', body: 'Google ended Job Tracker\'s Gmail access (this happens every 7 days during testing). Open Job Tracker and click Reconnect Gmail.', channels: ['in_app'] });
+  await sendTelegram('Job Tracker lost Gmail access (Google resets it every 7 days during testing). Open the app and click Reconnect Gmail to keep tracking.', user.telegram_chat_id);
 }

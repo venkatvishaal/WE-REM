@@ -1,220 +1,184 @@
-import * as cron from 'node-cron';
-import { dbGet, dbRun, dbAll, persistDb } from '../db/database';
-import { fetchNewMessages, isAuthenticated, clearTokens } from './gmail.service';
-import { parseEmail, upsertApplication, reparseStoredEmails } from './parser.service';
-import { verifyAllApplications } from './portal.service';
-import { notifyStatusChange, notifyActionRequired, notifySyncComplete, notifyError, notifyJobEmail } from './notification.service';
+import { dbGet, dbRun, dbAll } from '../db/database';
+import { fetchNewMessages } from './gmail.service';
+import { parseEmail, upsertApplication, reparseStoredEmails, stripHtml } from './parser.service';
+import { notifyStatusChange, notifyActionRequired, notifySyncComplete, notifyError, notifyJobEmail, notifyReconnectNeeded, dispatch } from './notification.service';
+import { getSetting, setSetting } from './user.service';
+import { candidatePortalUrl } from '../utils/workday-patterns';
 import { generateId } from '../utils/crypto';
 
-let gmailCronJob: cron.ScheduledTask | null = null;
-let portalCronJob: cron.ScheduledTask | null = null;
-let syncRunning = false;
+const BODY_LIMIT = 4000;
+const running = new Set<string>(); // user IDs with a sync in progress
 
-// ── Gmail Sync ─────────────────────────────────────────────────
-export async function runGmailSync(forceFull = false): Promise<{ emailsFetched: number; appsCreated: number; appsUpdated: number }> {
-  if (syncRunning) {
-    console.log('[Monitor] Already running, skipping');
-    return { emailsFetched: 0, appsCreated: 0, appsUpdated: 0 };
-  }
-  if (!isAuthenticated()) {
-    console.log('[Monitor] Not authenticated');
-    return { emailsFetched: 0, appsCreated: 0, appsUpdated: 0 };
-  }
+/** What we keep of an email: the first 4 KB of text plus any candidate-portal link (often only in the HTML). */
+export function storedBody(bodyText: string, bodyHtml: string): string {
+  const text = (bodyText || stripHtml(bodyHtml || '')).slice(0, BODY_LIMIT);
+  const portal = candidatePortalUrl(bodyHtml || '');
+  return portal && !text.includes(portal) ? `${text}\n${portal}` : text;
+}
 
-  syncRunning = true;
+// ── Gmail sync for one user ────────────────────────────────────
+export async function runGmailSync(userId: string, forceFull = false): Promise<{ emailsFetched: number; appsCreated: number; appsUpdated: number }> {
+  const none = { emailsFetched: 0, appsCreated: 0, appsUpdated: 0 };
+  if (running.has(userId)) return none;
+  const user = await dbGet<{ gmail_tokens_enc: string | null; gmail_history_id: string | null }>(
+    'SELECT gmail_tokens_enc, gmail_history_id FROM users WHERE id = ?', [userId]);
+  if (!user?.gmail_tokens_enc) return none;
+
+  running.add(userId);
   const syncId = generateId();
   const startedAt = new Date().toISOString();
-
-  dbRun(`INSERT INTO sync_log (id, sync_type, status, started_at) VALUES (?, 'gmail', 'running', ?)`, [syncId, startedAt]);
-  dbRun(`UPDATE settings SET value = 'syncing', updated_at = ? WHERE key = 'sync_status'`, [startedAt]);
+  await dbRun(`INSERT INTO sync_log (id, user_id, sync_type, status, started_at) VALUES (?, ?, 'gmail', 'running', ?)`, [syncId, userId, startedAt]);
+  await dbRun(`UPDATE users SET sync_status = 'syncing' WHERE id = ?`, [userId]);
 
   let emailsFetched = 0, emailsParsed = 0, appsCreated = 0, appsUpdated = 0;
-  let syncError: string | null = null;
+  let finalStatus = 'idle';
 
   try {
-    const historyIdRow = dbGet<{ value: string }>('SELECT value FROM settings WHERE key = ?', ['gmail_history_id']);
-    const sinceHistoryId = forceFull ? undefined : (historyIdRow?.value || undefined);
-
-    // Get all message IDs already stored in local DB to avoid wasting API quota re-downloading them
-    const existingRows = dbAll<{ gmail_message_id: string }>('SELECT gmail_message_id FROM email_messages');
+    const sinceHistoryId = forceFull ? undefined : (user.gmail_history_id || undefined);
+    const existingRows = await dbAll<{ gmail_message_id: string }>('SELECT gmail_message_id FROM email_messages WHERE user_id = ?', [userId]);
     const existingIds = new Set(existingRows.map((r) => r.gmail_message_id));
 
-    console.log(`[Monitor] Fetching job application messages (mode: ${forceFull ? 'full scrape' : sinceHistoryId ? `historyId ${sinceHistoryId}` : 'full search'})...`);
-    const messages = await fetchNewMessages(sinceHistoryId, 500, forceFull, existingIds);
+    const messages = await fetchNewMessages(userId, sinceHistoryId, 500, forceFull, existingIds);
     emailsFetched = messages.length;
-    console.log(`[Monitor] Fetched ${emailsFetched} messages from Gmail`);
 
     for (const msg of messages) {
-      const existingEmail = dbGet('SELECT id FROM email_messages WHERE gmail_message_id = ?', [msg.id]);
+      const existingEmail = await dbGet<{ id: string }>('SELECT id FROM email_messages WHERE user_id = ? AND gmail_message_id = ?', [userId, msg.id]);
       let emailMessageId: string;
 
       if (!existingEmail) {
         emailMessageId = generateId();
-        dbRun(
-          `INSERT INTO email_messages (id, gmail_message_id, subject, sender, received_at, body_text, body_html, parsed)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
-          [
-            emailMessageId,
-            msg.id,
-            msg.subject,
-            msg.sender,
-            msg.receivedAt,
-            msg.bodyText?.slice(0, 50000) || '',
-            msg.bodyHtml?.slice(0, 100000) || '',
-          ],
+        await dbRun(
+          `INSERT INTO email_messages (id, user_id, gmail_message_id, subject, sender, received_at, body_text, parsed)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0) ON CONFLICT (user_id, gmail_message_id) DO NOTHING`,
+          [emailMessageId, userId, msg.id, msg.subject, msg.sender, msg.receivedAt, storedBody(msg.bodyText, msg.bodyHtml)],
         );
       } else {
-        emailMessageId = (existingEmail as any).id;
+        emailMessageId = existingEmail.id;
       }
 
       try {
         const parsed = parseEmail(msg);
-        if (parsed) {
-          emailsParsed++;
-          const result = upsertApplication(parsed, emailMessageId);
+        if (!parsed) continue;
+        emailsParsed++;
+        const result = await upsertApplication(userId, parsed, emailMessageId);
+        await dbRun('UPDATE email_messages SET parsed = 1, application_id = ? WHERE id = ? AND user_id = ?', [result.applicationId, emailMessageId, userId]);
 
-          dbRun('UPDATE email_messages SET parsed = 1, application_id = ? WHERE id = ?', [result.applicationId, emailMessageId]);
-
-          if (result.isNew) {
-            appsCreated++;
-          } else {
-            appsUpdated++;
-            if (result.statusChanged && result.previousStatus) {
-              const app = dbGet<any>('SELECT company_name, job_title FROM applications WHERE id = ?', [result.applicationId]);
-              if (app) await notifyStatusChange(result.applicationId, app.company_name, app.job_title, result.previousStatus, parsed.status);
-            }
-          }
-
-          // Phone alert for every newly fetched job email (reparse never reaches here)
-          const alertApp = dbGet<any>('SELECT company_name, job_title FROM applications WHERE id = ?', [result.applicationId]);
-          if (alertApp) await notifyJobEmail(alertApp.company_name, alertApp.job_title, parsed.eventType, msg.subject, msg.receivedAt);
-
-          if (['assessment', 'document_request', 'interview'].includes(parsed.eventType)) {
-            const app = dbGet<any>('SELECT company_name, job_title FROM applications WHERE id = ?', [result.applicationId]);
-            if (app) {
-              await notifyActionRequired(
-                result.applicationId,
-                app.company_name,
-                app.job_title,
-                parsed.eventType === 'interview'
-                  ? 'Interview scheduled'
-                  : parsed.eventType === 'assessment'
-                  ? 'Assessment pending'
-                  : 'Document requested',
-              );
-            }
+        const app = await dbGet<any>('SELECT company_name, job_title FROM applications WHERE id = ? AND user_id = ?', [result.applicationId, userId]);
+        if (result.isNew) appsCreated++;
+        else {
+          appsUpdated++;
+          if (app && result.statusChanged && result.previousStatus) {
+            await notifyStatusChange(userId, result.applicationId, app.company_name, app.job_title, result.previousStatus, parsed.status);
           }
         }
+        if (!app) continue;
+
+        // Phone alert for every newly fetched job email (reparse never reaches here)
+        await notifyJobEmail(userId, app.company_name, app.job_title, parsed.eventType, msg.subject, msg.receivedAt);
+
+        if (['assessment', 'document_request', 'interview'].includes(parsed.eventType)) {
+          const action = parsed.eventType === 'interview' ? 'Interview scheduled' : parsed.eventType === 'assessment' ? 'Assessment pending' : 'Document requested';
+          await notifyActionRequired(userId, result.applicationId, app.company_name, app.job_title, action);
+        }
       } catch (err) {
-        console.error(`[Monitor] Parse error for message ${msg.id}:`, err);
+        console.error(`[Monitor] Parse error for a message of user ${userId}:`, err);
       }
     }
 
     // Pick up any stored emails not processed yet (e.g. from a sync that failed mid-way)
-    try {
-      const reparseRes = await reparseStoredEmails(true);
-      appsCreated += reparseRes.appsCreated;
-      appsUpdated += reparseRes.appsUpdated;
-      console.log(`[Monitor] Reparsed stored DB emails: ${reparseRes.parsed}/${reparseRes.total} parsed (${reparseRes.appsCreated} new, ${reparseRes.appsUpdated} updated)`);
-    } catch (err) {
-      console.warn('[Monitor] Reparse stored emails note:', err);
-    }
+    const reparseRes = await reparseStoredEmails(userId, true);
+    appsCreated += reparseRes.appsCreated;
+    appsUpdated += reparseRes.appsUpdated;
 
-    // Save history ID
     const latestHistoryId = (messages[0] as any)?._historyId || '';
-    if (latestHistoryId) {
-      dbRun(`UPDATE settings SET value = ?, updated_at = ? WHERE key = 'gmail_history_id'`, [latestHistoryId, new Date().toISOString()]);
-    }
+    if (latestHistoryId) await dbRun('UPDATE users SET gmail_history_id = ? WHERE id = ?', [latestHistoryId, userId]);
 
     const now = new Date().toISOString();
-    dbRun(`UPDATE settings SET value = ?, updated_at = ? WHERE key = 'last_gmail_sync'`, [now, now]);
-    await notifySyncComplete(emailsFetched, appsCreated, appsUpdated);
-    dbRun(
+    await setSetting(userId, 'last_gmail_sync', now);
+    await notifySyncComplete(userId, emailsFetched, appsCreated, appsUpdated);
+    await dbRun(
       `UPDATE sync_log SET status = 'success', emails_fetched = ?, emails_parsed = ?, apps_created = ?, apps_updated = ?, completed_at = ? WHERE id = ?`,
       [emailsFetched, emailsParsed, appsCreated, appsUpdated, now, syncId],
     );
-
-    console.log(`[Monitor] Sync complete: ${emailsFetched} fetched, ${emailsParsed} parsed, ${appsCreated} new apps, ${appsUpdated} updated apps`);
+    console.log(`[Monitor] User ${userId}: ${emailsFetched} fetched, ${appsCreated} new, ${appsUpdated} updated`);
     return { emailsFetched, appsCreated, appsUpdated };
   } catch (err: any) {
-    syncError = err?.message || String(err);
-    if (syncError && syncError.includes('invalid_grant')) {
-      console.warn('[Monitor] Gmail OAuth refresh token expired (invalid_grant). Clearing expired credentials and stopping sync loop.');
-      clearTokens();
-      stopMonitoring();
-      await notifyError(
-        'Gmail session expired',
-        'Your Google OAuth authorization has expired. Please go to Settings and click "Connect Gmail" to re-authenticate.',
-      );
-    } else if (
-      syncError &&
-      (syncError.includes('Quota exceeded') ||
-        syncError.includes('rateLimitExceeded') ||
-        syncError.includes('RESOURCE_EXHAUSTED'))
-    ) {
-      console.warn('[Monitor] Gmail API per-minute rate limit hit. Waiting for quota window to reset.');
-      const recentQuotaNotif = dbGet('SELECT id FROM notifications WHERE type = ? AND sent_at > datetime("now", "-15 minutes")', ['sync_quota']);
-      if (!recentQuotaNotif) {
-        dbRun(
-          `INSERT INTO notifications (id, type, title, body, channels, read, sent_at)
-           VALUES (?, 'sync_quota', 'Gmail rate limit reached', 'Gmail per-minute query rate limit reached. Background sync will automatically resume once the window resets.', '["in_app"]', 0, datetime("now"))`,
-          [generateId()],
-        );
-      }
+    const syncError = String(err?.message || err);
+    if (syncError.includes('invalid_grant')) {
+      // Testing-mode tokens expire every 7 days; keep the user's data, ask them to reconnect
+      finalStatus = 'reconnect_needed';
+      await notifyReconnectNeeded(userId);
+    } else if (/Quota exceeded|rateLimitExceeded|RESOURCE_EXHAUSTED/.test(syncError)) {
+      const recent = await dbGet('SELECT id FROM notifications WHERE user_id = ? AND type = ? AND sent_at > ?',
+        [userId, 'sync_quota', new Date(Date.now() - 15 * 60000).toISOString()]);
+      if (!recent) await dispatch(userId, { type: 'sync_quota', title: 'Gmail rate limit reached', body: 'Gmail rate limit reached. Sync resumes automatically.', channels: ['in_app'] });
     } else {
-      console.error('[Monitor] Sync error:', err);
-      await notifyError('Gmail sync failed', syncError || undefined);
+      console.error(`[Monitor] Sync error for user ${userId}:`, syncError);
+      await notifyError(userId, 'Gmail sync failed', syncError);
     }
-    dbRun(`UPDATE sync_log SET status = 'error', error = ?, completed_at = ? WHERE id = ?`, [syncError, new Date().toISOString(), syncId]);
-    return { emailsFetched: 0, appsCreated: 0, appsUpdated: 0 };
+    await dbRun(`UPDATE sync_log SET status = 'error', error = ?, completed_at = ? WHERE id = ?`, [syncError, new Date().toISOString(), syncId]);
+    return none;
   } finally {
-    syncRunning = false;
-    dbRun(`UPDATE settings SET value = 'idle', updated_at = ? WHERE key = 'sync_status'`, [new Date().toISOString()]);
-    persistDb();
+    running.delete(userId);
+    await dbRun(`UPDATE users SET sync_status = ?, last_synced_at = ? WHERE id = ?`, [finalStatus, new Date().toISOString(), userId])
+      .catch((err) => console.error('[Monitor] Could not save sync status:', err));
   }
 }
 
-// ── Portal Verification ────────────────────────────────────────
-async function runPortalVerification(): Promise<void> {
-  const enabled = dbGet<{ value: string }>('SELECT value FROM settings WHERE key = ?', ['portal_verify_enabled'])?.value === 'true';
-  if (!enabled) return;
-  console.log('[Monitor] Running portal verification...');
-  try {
-    await verifyAllApplications();
-  } catch (err) {
-    console.error('[Monitor] Portal verification error:', err);
+// ── Round-robin scheduler ──────────────────────────────────────
+// shortcut: one process syncs one user every 10s (~360 users per 15-min round at most); past ~300 users move to a job queue
+const TICK_MS = 10_000;
+const SYNC_EVERY_MS = Number(process.env.GMAIL_SYNC_MINUTES || 15) * 60_000;
+let timer: NodeJS.Timeout | null = null;
+
+/** The connected user whose last sync is oldest, if it is due. */
+export async function nextUserToSync(now = Date.now()): Promise<string | undefined> {
+  const due = new Date(now - SYNC_EVERY_MS).toISOString();
+  const row = await dbGet<{ id: string }>(
+    `SELECT u.id FROM users u
+     WHERE u.gmail_tokens_enc IS NOT NULL AND u.sync_status <> 'reconnect_needed'
+       AND (u.last_synced_at IS NULL OR u.last_synced_at < ?)
+       AND NOT EXISTS (SELECT 1 FROM settings s WHERE s.user_id = u.id AND s.key = 'gmail_sync_enabled' AND s.value = 'false')
+     ORDER BY u.last_synced_at ASC NULLS FIRST LIMIT 1`,
+    [due],
+  );
+  return row?.id;
+}
+
+async function tick(): Promise<void> {
+  const userId = await nextUserToSync();
+  if (!userId) return;
+  await runGmailSync(userId);
+  if (process.env.ENABLE_PORTAL_CHECKS === 'true' && (await getSetting(userId, 'portal_verify_enabled')) === 'true') {
+    const { verifyAllApplications } = await import('./portal.service');
+    await verifyAllApplications(userId).catch((err) => console.error('[Monitor] Portal check error:', err));
   }
 }
 
-// ── Start/Stop ─────────────────────────────────────────────────
 export function startMonitoring(): void {
-  stopMonitoring(); // re-auth calls this again; don't stack cron jobs
-  const gmailCron = process.env.GMAIL_SYNC_CRON || '*/15 * * * *';
-  const portalCron = process.env.PORTAL_VERIFY_CRON || '0 */6 * * *';
-
-  gmailCronJob = cron.schedule(gmailCron, () => runGmailSync().catch(console.error));
-  portalCronJob = cron.schedule(portalCron, () => runPortalVerification().catch(console.error));
-
-  console.log(`[Monitor] Gmail cron: ${gmailCron}, Portal cron: ${portalCron}`);
-
-  // Initial sync after 3s
-  setTimeout(() => runGmailSync().catch(console.error), 3000);
+  if (timer) return;
+  let busy = false;
+  timer = setInterval(() => {
+    if (busy) return;
+    busy = true;
+    tick().catch((err) => console.error('[Monitor] Tick failed:', err)).finally(() => { busy = false; });
+  }, TICK_MS);
+  console.log(`[Monitor] Syncing each connected user every ${SYNC_EVERY_MS / 60000} min, one user per ${TICK_MS / 1000}s`);
 }
 
 export function stopMonitoring(): void {
-  gmailCronJob?.stop();
-  portalCronJob?.stop();
-  console.log('[Monitor] Stopped');
+  if (timer) clearInterval(timer);
+  timer = null;
 }
 
-export function getSyncStatus() {
-  const lastSync = dbGet<{ value: string }>('SELECT value FROM settings WHERE key = ?', ['last_gmail_sync'])?.value || null;
-  const syncStatus = dbGet<{ value: string }>('SELECT value FROM settings WHERE key = ?', ['sync_status'])?.value || 'idle';
+export async function getSyncStatus(userId: string) {
+  const user = await dbGet<{ sync_status: string; gmail_tokens_enc: string | null }>('SELECT sync_status, gmail_tokens_enc FROM users WHERE id = ?', [userId]);
   return {
-    isRunning: syncStatus === 'syncing',
-    lastSync,
+    isRunning: running.has(userId),
+    lastSync: (await getSetting(userId, 'last_gmail_sync')) || null,
+    gmailConnected: !!user?.gmail_tokens_enc,
+    reconnectNeeded: user?.sync_status === 'reconnect_needed',
     lastError: null as string | null,
-    gmailCron: process.env.GMAIL_SYNC_CRON || '*/15 * * * *',
-    nextRun: null as string | null,
+    syncEveryMinutes: SYNC_EVERY_MS / 60000,
   };
 }

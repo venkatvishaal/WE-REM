@@ -16,7 +16,7 @@ import {
   POSITION_FILLED_BODY_PATTERN,
   outcomeText,
 } from '../utils/workday-patterns';
-import { dbRun, dbGet, dbAll, persistDb } from '../db/database';
+import { dbRun, dbGet, dbAll } from '../db/database';
 import { generateId } from '../utils/crypto';
 
 export interface ParsedApplication {
@@ -390,10 +390,10 @@ const REAPPLY_AFTER_MS = 30 * 24 * 3600 * 1000;
 // Exact (case-insensitive) company match. A new acknowledgement is a new application
 // unless it is a duplicate confirmation of one from the last 7 days; any other email
 // (rejection, interview, ...) updates the company's most recently active open application.
-function findMatchingApplication(parsed: ParsedApplication): Record<string, any> | undefined {
-  const apps = dbAll<Record<string, any>>(
-    `SELECT * FROM applications WHERE company_name = ? COLLATE NOCASE ORDER BY last_activity_at DESC`,
-    [parsed.companyName],
+async function findMatchingApplication(userId: string, parsed: ParsedApplication): Promise<Record<string, any> | undefined> {
+  const apps = await dbAll<Record<string, any>>(
+    `SELECT * FROM applications WHERE user_id = ? AND lower(company_name) = lower(?) ORDER BY last_activity_at DESC`,
+    [userId, parsed.companyName],
   );
   if (apps.length === 0) return undefined;
 
@@ -428,13 +428,15 @@ function findMatchingApplication(parsed: ParsedApplication): Record<string, any>
   return apps.find((a) => !FINAL_STATUSES.includes(a.status)) || apps[0];
 }
 
-export function upsertApplication(
+// Application IDs below always come from findMatchingApplication (already scoped to userId) or are new.
+export async function upsertApplication(
+  userId: string,
   parsed: ParsedApplication,
   emailMessageId: string,
-): UpsertResult {
+): Promise<UpsertResult> {
   const now = new Date().toISOString();
 
-  const existing = findMatchingApplication(parsed);
+  const existing = await findMatchingApplication(userId, parsed);
 
   let applicationId: string;
   let isNew = false;
@@ -445,13 +447,14 @@ export function upsertApplication(
     applicationId = generateId();
     isNew = true;
 
-    dbRun(
+    await dbRun(
       `INSERT INTO applications
-        (id, company_name, job_title, requisition_id, portal_url, portal_tenant,
+        (id, user_id, company_name, job_title, requisition_id, portal_url, portal_tenant,
          status, applied_at, last_activity_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         applicationId,
+        userId,
         parsed.companyName,
         parsed.jobTitle,
         parsed.requisitionId || null,
@@ -465,51 +468,41 @@ export function upsertApplication(
       ],
     );
   } else {
-    applicationId = (existing as any).id;
-    previousStatus = (existing as any).status;
+    applicationId = existing.id;
+    previousStatus = existing.status;
 
     // If existing had generic title and we now have a specific title, upgrade it
-    if ((existing as any).job_title === 'Position Applied' && parsed.jobTitle !== 'Position Applied') {
-      dbRun(`UPDATE applications SET job_title = ? WHERE id = ?`, [parsed.jobTitle, applicationId]);
+    if (existing.job_title === GENERIC_TITLE && parsed.jobTitle !== GENERIC_TITLE) {
+      await dbRun(`UPDATE applications SET job_title = ? WHERE id = ?`, [parsed.jobTitle, applicationId]);
     }
 
-    if (
-      parsed.statusHint &&
-      parsed.status !== (existing as any).status &&
-      canTransitionStatus((existing as any).status, parsed.status)
-    ) {
+    if (parsed.statusHint && parsed.status !== existing.status && canTransitionStatus(existing.status, parsed.status)) {
       statusChanged = true;
-      dbRun(
-        `UPDATE applications SET status = ?, last_activity_at = MAX(last_activity_at, ?), updated_at = ? WHERE id = ?`,
+      await dbRun(
+        `UPDATE applications SET status = ?, last_activity_at = GREATEST(last_activity_at, ?), updated_at = ? WHERE id = ?`,
         [parsed.status, parsed.appliedAt, now, applicationId],
       );
     } else {
-      dbRun(
-        `UPDATE applications SET last_activity_at = MAX(last_activity_at, ?), updated_at = ? WHERE id = ?`,
+      await dbRun(
+        `UPDATE applications SET last_activity_at = GREATEST(last_activity_at, ?), updated_at = ? WHERE id = ?`,
         [parsed.appliedAt, now, applicationId],
       );
     }
 
     const isCandidateHome = (u?: string) => !!u && /\/userHome$|\/my-applications\//.test(u);
-    if (parsed.portalUrl && (!(existing as any).portal_url || (isCandidateHome(parsed.portalUrl) && !isCandidateHome((existing as any).portal_url)))) {
-      dbRun(
-        `UPDATE applications SET portal_url = ?, portal_tenant = ? WHERE id = ?`,
-        [parsed.portalUrl, parsed.portalTenant || null, applicationId],
-      );
+    if (parsed.portalUrl && (!existing.portal_url || (isCandidateHome(parsed.portalUrl) && !isCandidateHome(existing.portal_url)))) {
+      await dbRun(`UPDATE applications SET portal_url = ?, portal_tenant = ? WHERE id = ?`, [parsed.portalUrl, parsed.portalTenant || null, applicationId]);
     }
 
-    if (parsed.requisitionId && !(existing as any).requisition_id) {
-      dbRun(
-        `UPDATE applications SET requisition_id = ? WHERE id = ?`,
-        [parsed.requisitionId, applicationId],
-      );
+    if (parsed.requisitionId && !existing.requisition_id) {
+      await dbRun(`UPDATE applications SET requisition_id = ? WHERE id = ?`, [parsed.requisitionId, applicationId]);
     }
   }
 
   // Company reply (acknowledgements are automated, so they don't count)
   const response = responseOf(parsed);
   if (response) {
-    dbRun(
+    await dbRun(
       `UPDATE applications SET
          first_response_at = CASE WHEN first_response_at IS NULL OR ? < first_response_at THEN ? ELSE first_response_at END,
          last_response_type = CASE WHEN last_response_at IS NULL OR ? >= last_response_at THEN ? ELSE last_response_type END,
@@ -521,19 +514,19 @@ export function upsertApplication(
 
   // Add timeline event (once per email, so reprocessing never duplicates it)
   const metadata = JSON.stringify({ raw_email_id: emailMessageId, status_to: parsed.status });
-  const alreadyLogged = dbGet(
-    `SELECT id FROM timeline_events WHERE source = 'email' AND metadata LIKE ? LIMIT 1`,
-    [`%"raw_email_id":"${emailMessageId}"%`],
+  const alreadyLogged = await dbGet(
+    `SELECT id FROM timeline_events WHERE application_id IN (SELECT id FROM applications WHERE user_id = ?)
+       AND source = 'email' AND metadata LIKE ? LIMIT 1`,
+    [userId, `%"raw_email_id":"${emailMessageId}"%`],
   );
   if (alreadyLogged) return { applicationId, isNew, statusChanged, previousStatus };
 
-  const timelineId = generateId();
-  dbRun(
+  await dbRun(
     `INSERT INTO timeline_events
       (id, application_id, event_type, source, title, description, metadata, occurred_at, created_at)
      VALUES (?, ?, ?, 'email', ?, ?, ?, ?, ?)`,
     [
-      timelineId,
+      generateId(),
       applicationId,
       parsed.eventType,
       `${parsed.eventType.replace(/_/g, ' ').toUpperCase()}: ${parsed.jobTitle} at ${parsed.companyName}`,
@@ -547,10 +540,11 @@ export function upsertApplication(
   return { applicationId, isNew, statusChanged, previousStatus };
 }
 
-// ── Reparse all stored emails in the database ──────────────────
-export async function reparseStoredEmails(onlyUnparsed = false): Promise<{ total: number; parsed: number; appsCreated: number; appsUpdated: number }> {
-  const emails = dbAll<any>(
-    `SELECT * FROM email_messages ${onlyUnparsed ? 'WHERE parsed = 0' : ''} ORDER BY received_at ASC`,
+// ── Reparse one user's stored emails ───────────────────────────
+export async function reparseStoredEmails(userId: string, onlyUnparsed = false): Promise<{ total: number; parsed: number; appsCreated: number; appsUpdated: number }> {
+  const emails = await dbAll<any>(
+    `SELECT * FROM email_messages WHERE user_id = ? ${onlyUnparsed ? 'AND parsed = 0' : ''} ORDER BY received_at ASC`,
+    [userId],
   );
   let parsedCount = 0;
   let appsCreated = 0;
@@ -564,51 +558,47 @@ export async function reparseStoredEmails(onlyUnparsed = false): Promise<{ total
       sender: email.sender,
       receivedAt: email.received_at,
       bodyText: email.body_text || '',
-      bodyHtml: email.body_html || '',
+      bodyHtml: '',
       labelIds: [],
     };
 
     const parsed = parseEmail(rawMsg);
     if (parsed) {
       parsedCount++;
-      const result = upsertApplication(parsed, email.id);
+      const result = await upsertApplication(userId, parsed, email.id);
       if (result.isNew) appsCreated++;
       else appsUpdated++;
 
-      dbRun('UPDATE email_messages SET parsed = 1, application_id = ? WHERE id = ?', [result.applicationId, email.id]);
+      await dbRun('UPDATE email_messages SET parsed = 1, application_id = ? WHERE id = ? AND user_id = ?', [result.applicationId, email.id, userId]);
     } else {
       // parsed = 1 means "processed"; non-application emails are not retried every sync
-      dbRun('UPDATE email_messages SET parsed = 1 WHERE id = ?', [email.id]);
+      await dbRun('UPDATE email_messages SET parsed = 1 WHERE id = ? AND user_id = ?', [email.id, userId]);
     }
   }
 
   // Many emails carry no portal link; reuse one from another email of the same company
-  dbRun(
+  await dbRun(
     `UPDATE applications SET portal_url = (
        SELECT b.portal_url FROM applications b
-       WHERE b.company_name = applications.company_name AND b.portal_url LIKE '%/userHome' LIMIT 1)
-     WHERE (portal_url IS NULL OR portal_url NOT LIKE '%/userHome')
-       AND EXISTS (SELECT 1 FROM applications b WHERE b.company_name = applications.company_name AND b.portal_url LIKE '%/userHome')`,
+       WHERE b.user_id = applications.user_id AND b.company_name = applications.company_name AND b.portal_url LIKE '%/userHome' LIMIT 1)
+     WHERE user_id = ? AND (portal_url IS NULL OR portal_url NOT LIKE '%/userHome')
+       AND EXISTS (SELECT 1 FROM applications b WHERE b.user_id = applications.user_id AND b.company_name = applications.company_name AND b.portal_url LIKE '%/userHome')`,
+    [userId],
   );
 
-  persistDb();
-  return {
-    total: emails.length,
-    parsed: parsedCount,
-    appsCreated,
-    appsUpdated,
-  };
+  return { total: emails.length, parsed: parsedCount, appsCreated, appsUpdated };
 }
 
-// ── Rebuild all email-derived applications from stored emails ──
+// ── Rebuild one user's email-derived applications from stored emails ──
 // Keeps applications that have a manual timeline event (added or edited by hand).
-export async function rebuildFromEmails() {
-  dbRun(`DELETE FROM timeline_events WHERE source = 'email'`);
-  dbRun(
-    `DELETE FROM applications WHERE id NOT IN
+export async function rebuildFromEmails(userId: string) {
+  await dbRun(`DELETE FROM timeline_events WHERE source = 'email' AND application_id IN (SELECT id FROM applications WHERE user_id = ?)`, [userId]);
+  await dbRun(
+    `DELETE FROM applications WHERE user_id = ? AND id NOT IN
        (SELECT application_id FROM timeline_events WHERE source = 'manual')`,
+    [userId],
   );
-  dbRun(`UPDATE applications SET first_response_at = NULL, last_response_type = NULL, last_response_at = NULL`);
-  dbRun(`UPDATE email_messages SET parsed = 0, application_id = NULL`);
-  return reparseStoredEmails();
+  await dbRun(`UPDATE applications SET first_response_at = NULL, last_response_type = NULL, last_response_at = NULL WHERE user_id = ?`, [userId]);
+  await dbRun(`UPDATE email_messages SET parsed = 0, application_id = NULL WHERE user_id = ?`, [userId]);
+  return reparseStoredEmails(userId);
 }

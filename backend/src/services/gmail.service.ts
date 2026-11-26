@@ -1,7 +1,6 @@
 import { google } from 'googleapis';
-import * as fs from 'fs';
-import * as path from 'path';
 import { encrypt, decrypt } from '../utils/crypto';
+import { dbGet, dbRun } from '../db/database';
 
 export interface GmailTokens {
   access_token: string;
@@ -12,24 +11,10 @@ export interface GmailTokens {
   id_token?: string | null;
 }
 
-function resolveTokenFile(): string {
-  if (process.env.TOKEN_FILE && fs.existsSync(path.resolve(process.env.TOKEN_FILE))) {
-    return path.resolve(process.env.TOKEN_FILE);
-  }
-  const localData = path.resolve('./data/.tokens.enc');
-  if (fs.existsSync(localData)) return localData;
-  const backendData = path.resolve(__dirname, '../../data/.tokens.enc');
-  if (fs.existsSync(backendData)) return backendData;
-  return localData;
-}
-
-function getEncryptionKeys(): string[] {
-  const keys: string[] = [];
-  if (process.env.TOKEN_ENCRYPTION_KEY) keys.push(process.env.TOKEN_ENCRYPTION_KEY);
-  if (process.env.ENCRYPTION_KEY) keys.push(process.env.ENCRYPTION_KEY);
-  keys.push('change_this_to_a_random_32char_secret!!');
-  keys.push('default-insecure-key-change-me!!');
-  return [...new Set(keys)];
+function encryptionKey(): string {
+  const key = process.env.TOKEN_ENCRYPTION_KEY;
+  if (!key || key.length < 16) throw new Error('Set TOKEN_ENCRYPTION_KEY (at least 16 random characters) in .env');
+  return key;
 }
 
 function getOAuth2Client() {
@@ -40,94 +25,68 @@ function getOAuth2Client() {
   );
 }
 
+// Read-only Gmail plus the user's email address (to know who signed in)
 const SCOPES = [
+  'openid',
+  'https://www.googleapis.com/auth/userinfo.email',
   'https://www.googleapis.com/auth/gmail.readonly',
-  'https://www.googleapis.com/auth/gmail.send',
 ];
 
 // ── OAuth Flow ─────────────────────────────────────────────────
-export function getAuthUrl(): string {
-  const oauth2Client = getOAuth2Client();
-  return oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    scope: SCOPES,
-    prompt: 'consent',
-  });
+export function getAuthUrl(state: string): string {
+  return getOAuth2Client().generateAuthUrl({ access_type: 'offline', scope: SCOPES, prompt: 'consent', state });
 }
 
-export async function exchangeCode(code: string): Promise<GmailTokens> {
-  const oauth2Client = getOAuth2Client();
-  const { tokens } = await oauth2Client.getToken(code);
-  saveTokens(tokens as GmailTokens);
-  return tokens as GmailTokens;
+/** Exchanges the OAuth code; returns the verified Google email and the tokens. */
+export async function exchangeCode(code: string): Promise<{ email: string; tokens: GmailTokens }> {
+  const client = getOAuth2Client();
+  const { tokens } = await client.getToken(code);
+  if (!tokens.id_token) throw new Error('Google did not return an ID token');
+  const ticket = await client.verifyIdToken({ idToken: tokens.id_token, audience: process.env.GMAIL_CLIENT_ID });
+  const payload = ticket.getPayload();
+  if (!payload?.email || !payload.email_verified) throw new Error('Google account email is not verified');
+  if (!String(tokens.scope || '').includes('gmail.readonly')) throw new Error('Gmail read access was not granted. Sign in again and tick the Gmail box.');
+  return { email: payload.email, tokens: tokens as GmailTokens };
 }
 
-// ── Token Persistence ──────────────────────────────────────────
-function saveTokens(tokens: GmailTokens): void {
-  const tokenFile = resolveTokenFile();
-  const dir = path.dirname(tokenFile);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-  const primaryKey = getEncryptionKeys()[0];
-  const encrypted = encrypt(JSON.stringify(tokens), primaryKey);
-  fs.writeFileSync(tokenFile, encrypted, 'utf-8');
-  console.log('[Gmail] Tokens saved (encrypted)');
+// ── Token persistence (per user, encrypted in the users table) ──
+export async function saveTokens(userId: string, tokens: GmailTokens): Promise<void> {
+  await dbRun(
+    `UPDATE users SET gmail_tokens_enc = ?, gmail_connected_at = iso_now(), sync_status = 'idle', reconnect_reminded = 0 WHERE id = ?`,
+    [encrypt(JSON.stringify(tokens), encryptionKey()), userId],
+  );
 }
 
-export function loadTokens(): GmailTokens | null {
-  const tokenFile = resolveTokenFile();
-  if (!fs.existsSync(tokenFile)) return null;
-
+export async function loadTokens(userId: string): Promise<GmailTokens | null> {
+  const row = await dbGet<{ gmail_tokens_enc: string | null }>('SELECT gmail_tokens_enc FROM users WHERE id = ?', [userId]);
+  if (!row?.gmail_tokens_enc) return null;
   try {
-    const encrypted = fs.readFileSync(tokenFile, 'utf-8');
-    const keys = getEncryptionKeys();
-
-    for (const key of keys) {
-      try {
-        const decrypted = decrypt(encrypted, key);
-        return JSON.parse(decrypted) as GmailTokens;
-      } catch {
-        // try next key
-      }
-    }
-    console.error('[Gmail] Failed to decrypt tokens with available keys');
-    return null;
-  } catch (err) {
-    console.error('[Gmail] Failed to load tokens:', err);
+    return JSON.parse(decrypt(row.gmail_tokens_enc, encryptionKey())) as GmailTokens;
+  } catch {
+    console.error('[Gmail] Failed to decrypt tokens for a user (TOKEN_ENCRYPTION_KEY changed?)');
     return null;
   }
 }
 
-export function clearTokens(): void {
-  const tokenFile = resolveTokenFile();
-  if (fs.existsSync(tokenFile)) {
-    try { fs.unlinkSync(tokenFile); } catch {}
-    console.log('[Gmail] Tokens cleared');
-  }
-  const local = path.resolve('./data/.tokens.enc');
-  if (fs.existsSync(local)) try { fs.unlinkSync(local); } catch {}
-  const backend = path.resolve(__dirname, '../../data/.tokens.enc');
-  if (fs.existsSync(backend)) try { fs.unlinkSync(backend); } catch {}
-}
-
-export function isAuthenticated(): boolean {
-  return loadTokens() !== null;
+/** Revokes Google access (best effort) and forgets the tokens and sync position. */
+export async function disconnectGmail(userId: string): Promise<void> {
+  const tokens = await loadTokens(userId);
+  const token = tokens?.refresh_token || tokens?.access_token;
+  if (token) await getOAuth2Client().revokeToken(token).catch((err) => console.warn('[Gmail] Token revoke failed:', err?.message));
+  await dbRun(`UPDATE users SET gmail_tokens_enc = NULL, gmail_history_id = NULL, sync_status = 'idle' WHERE id = ?`, [userId]);
 }
 
 // ── Authenticated Gmail Client ─────────────────────────────────
-export function getAuthenticatedClient() {
-  const tokens = loadTokens();
+export async function getAuthenticatedClient(userId: string) {
+  const tokens = await loadTokens(userId);
   if (!tokens) throw new Error('Not authenticated — no tokens found');
 
   const oauth2Client = getOAuth2Client();
   oauth2Client.setCredentials(tokens as any);
-
-  // Auto-refresh & persist new tokens
+  // Google only returns a new access token on refresh; keep the refresh token
   oauth2Client.on('tokens', (newTokens) => {
-    const merged = { ...tokens, ...newTokens };
-    saveTokens(merged as GmailTokens);
+    saveTokens(userId, { ...tokens, ...newTokens } as GmailTokens).catch((err) => console.error('[Gmail] Token save failed:', err));
   });
-
   return oauth2Client;
 }
 
@@ -257,12 +216,13 @@ async function getMessageWithRetry(gmail: any, id: string, retries = 2): Promise
 }
 
 export async function fetchNewMessages(
+  userId: string,
   sinceHistoryId?: string,
   maxResults = 500,
   forceFullSearch = false,
   skipIds?: Set<string>,
 ): Promise<RawGmailMessage[]> {
-  const auth = getAuthenticatedClient();
+  const auth = await getAuthenticatedClient(userId);
   const gmail = google.gmail({ version: 'v1', auth });
 
   let messageIds: string[] = [];
@@ -389,35 +349,4 @@ export async function fetchNewMessages(
   }
 
   return messages.map((m) => ({ ...m, _historyId: newHistoryId } as any));
-}
-
-export async function getLatestHistoryId(): Promise<string> {
-  const auth = getAuthenticatedClient();
-  const gmail = google.gmail({ version: 'v1', auth });
-  const res = await gmail.users.getProfile({ userId: 'me' });
-  return res.data.historyId || '';
-}
-
-export async function sendEmail(to: string, subject: string, bodyHtml: string): Promise<void> {
-  const auth = getAuthenticatedClient();
-  const gmail = google.gmail({ version: 'v1', auth });
-
-  const profileRes = await gmail.users.getProfile({ userId: 'me' });
-  const from = profileRes.data.emailAddress || '';
-
-  const raw = [
-    `From: ${from}`,
-    `To: ${to}`,
-    `Subject: ${subject}`,
-    'MIME-Version: 1.0',
-    'Content-Type: text/html; charset=utf-8',
-    '',
-    bodyHtml,
-  ].join('\r\n');
-
-  const encoded = Buffer.from(raw).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  await gmail.users.messages.send({
-    userId: 'me',
-    requestBody: { raw: encoded },
-  });
 }
