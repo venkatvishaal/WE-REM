@@ -263,9 +263,57 @@ function cleanJobTitle(title: string, companyName?: string): string {
   return cleaned;
 }
 
+// ── Google Forms receipts ("Send me a copy of my responses") ──
+const GOOGLE_FORMS_SENDER = /forms-receipts-noreply@google\.com/i;
+const FORM_JOB_WORDS = /\b(hiring|recruit\w*|internships?|interns?|jobs?|careers?|campus|placements?|off-campus|vacanc\w*|openings?|graduates?|freshers?|prescreening)\b/i;
+const FORM_NOT_JOB_WORDS = /\b(training|workshop|webinar|feedback|scholarship|course|bootcamp|hackathon|event|whatsapp|seminar|quiz|survey|selection)\b/i;
+// Words that end the company part of a form title ("Deloitte - Campus Hiring", "TCS 2027 batch hiring")
+const FORM_TITLE_STOP = /^(?:x|only|regular|campus|off-campus|intern|interns|internship|hiring|graduate|batch|recruitment|drive|job|jobs|careers?|for|registration|application|freshers?|\d{4})$/i;
+
+/** Company and role from a job-application Google Form receipt; null for trainings, workshops and other forms. */
+export function googleFormApplication(subject: string, bodyText = ''): { companyName: string; jobTitle: string } | null {
+  // Newer: "Thanks for filling out this form: <title>"; older: subject is the title, body says "Thanks for filling in <title>"
+  const fromSubject = subject.match(/^thanks for filling (?:out|in) (?:this form:)?\s*(.+)$/i)?.[1];
+  const fromBody = bodyText.match(/thanks for filling (?:out|in) (?:this form:)?\s*(.+?)(?:\s+here's what was received|\s+you're receiving|\n|$)/i)?.[1];
+  const title = (fromSubject || fromBody || subject)
+    .replace(/[^\p{L}\p{N}\s&.,'()\/|:–-]/gu, ' ') // emojis and symbols
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!FORM_JOB_WORDS.test(title) || FORM_NOT_JOB_WORDS.test(title)) return null;
+
+  const words = title.split(' ');
+  const companyWords: string[] = [];
+  for (const w of words) {
+    if (/^[-–|:]$/.test(w) || FORM_TITLE_STOP.test(w)) break;
+    companyWords.push(w.replace(/[-–|:,]+$/, ''));
+    if (/[-–|:,]$/.test(w)) break;
+  }
+  // Not cleanCompanyName: the title is already cut at the company, and that would drop words like "Global"
+  const companyName = companyWords.join(' ').trim();
+  if (companyName.length < 2 || INVALID_COMPANIES.has(companyName.toLowerCase())) return null;
+  const rest = title.slice(title.indexOf(companyWords[companyWords.length - 1]) + companyWords[companyWords.length - 1].length)
+    .replace(/^[\s\-–|:,]+/, '')
+    .replace(/^(?:only|x\s+\S+)\s+/i, '') // "Insight Global only Intern…", "IncuBrix x SASTRA 2027…"
+    .trim();
+  return { companyName, jobTitle: rest ? rest.slice(0, 80) : GENERIC_TITLE };
+}
+
 // ── Main parse function ────────────────────────────────────────
 export function parseEmail(msg: RawGmailMessage): ParsedApplication | null {
   const bodyText = msg.bodyText || stripHtml(msg.bodyHtml || '');
+
+  if (GOOGLE_FORMS_SENDER.test(msg.sender)) {
+    const form = googleFormApplication(msg.subject, bodyText);
+    if (!form) return null;
+    return {
+      ...form,
+      status: 'applied',
+      eventType: 'acknowledged',
+      appliedAt: msg.receivedAt,
+      rawEmailId: msg.id,
+      subject: msg.subject,
+    };
+  }
 
   // Filter out OTP, verification codes, and job alert emails
   if (isNonApplicationEmail(msg.subject, msg.sender)) {

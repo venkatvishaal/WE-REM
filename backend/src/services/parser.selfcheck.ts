@@ -76,6 +76,31 @@ const apply = (m: ReturnType<typeof msg>) => {
   assert.notStrictEqual(st('Thanks for taking the Sample Test', 'HackerRank Hiring Team <support@hackerrankforwork.com>', 'Solving code challenges is a great way to keep your skills sharp for interviews.'), 'interview');
   assert.strictEqual(co('Thank you for your interest in HackerRank || Customer Experience Engineer, L1', 'no-reply@hackerrank.com'), 'HackerRank');
 
+  // Google Forms receipts: job forms become applications, trainings/workshops/feedback don't
+  const FORMS = 'Forms response receipts <forms-receipts-noreply@google.com>';
+  const form = (s: string, body = '') => parseEmail(msg(s, FORMS, '2026-08-28T00:00:00Z', body));
+  assert.strictEqual(form('Thanks for filling in this form: Deloitte - Campus Hiring for 2027 batch')?.companyName, 'Deloitte');
+  assert.strictEqual(form('Thanks for filling in this form: Deloitte - Campus Hiring for 2027 batch')?.jobTitle, 'Campus Hiring for 2027 batch');
+  assert.strictEqual(form('Thanks for filling in this form: Infosys Regular Hiring for 2027 batch students')?.companyName, 'Infosys');
+  assert.strictEqual(form('Thanks for filling in this form:  TCS 2027 batch hiring - Submit CT/DT Ref No')?.companyName, 'TCS');
+  assert.strictEqual(form('Thanks for filling in this form: Ridecell Intern Hiring - Prescreening')?.companyName, 'Ridecell');
+  assert.strictEqual(form('Thanks for filling out this form: Insight Global only Intern hiring for 2027 batch students')?.companyName, 'Insight Global');
+  assert.strictEqual(form('Thanks for filling out this form: IncuBrix x SASTRA 2027 Graduate Hiring Interview Interest Registration')?.companyName, 'IncuBrix');
+  assert.strictEqual(form('Thanks for filling out this form: IncuBrix x SASTRA 2027 Graduate Hiring Interview Interest Registration')?.jobTitle, '2027 Graduate Hiring Interview Interest Registration');
+  assert.strictEqual(form('Thanks for filling out this form: Insight Global only Intern hiring for 2027 batch students')?.jobTitle, 'Intern hiring for 2027 batch students');
+  assert.strictEqual(form('Thanks for filling in this form: 🌐 CyberWarLab Hiring Free 45 Days CyberSecurity Internship Application Form 🙌')?.companyName, 'CyberWarLab');
+  assert.strictEqual(form('Thanks for filling in this form: Deloitte - Campus Hiring for 2027 batch')?.status, 'applied');
+  for (const notJob of [
+    'Thanks for filling in this form: Cloud Security Training Program – Registration Form ',
+    'Thanks for filling in this form: ICDFA Foundation: Cloud Security Engineering Scholarship – Expression of Interest',
+    'Thanks for filling in this form: AWS Cloud Technical Essentials - Limited (15 Seats) (4 Weeks Lab)',
+    'OWASP Coimbatore - Feedback Form',
+    'OWASP COIMBATORE WhatsApp Group Registration',
+    'SSB & BLC SELECTION 2025',
+  ]) assert.strictEqual(form(notJob), null, `not a job form: ${notJob}`);
+  // Older receipts: subject is the bare title, body says "Thanks for filling in <title>"
+  assert.strictEqual(form('Acme Off-Campus Hiring 2026', "Thanks for filling in Acme Off-Campus Hiring 2026 Here's what was received.")?.companyName, 'Acme');
+
   // Same role re-applied 45 days later -> new application
   const r1 = await apply(msg('Exciting News: We have received your Application || Software Development Engineer Intern', 'no-reply@hackerrankcareers.com', '2026-10-05T00:00:00Z', 'Application received for the position of Software Development Engineer Intern.'));
   const r2 = await apply(msg('Exciting News: We have received your Application || Software Development Engineer Intern', 'no-reply@hackerrankcareers.com', '2026-11-20T00:00:00Z', 'Application received for the position of Software Development Engineer Intern.'));

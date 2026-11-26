@@ -164,6 +164,7 @@ export const ALL_APPLICATIONS_GMAIL_QUERY = [
   '"your interview"',
   '"ai interview"',
   '"thanks for taking"',
+  'from:forms-receipts-noreply@google.com', // Google Forms "send me a copy" receipts
   'from:greenhouse.io',
   'from:greenhouse-mail.io',
   'from:lever.co',
