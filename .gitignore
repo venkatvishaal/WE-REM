@@ -1,0 +1,10 @@
+# secrets
+.env
+.env.*
+!.env.example
+# personal data: Gmail DB, OAuth tokens, portal browser session cookies
+backend/data/
+# build output / deps
+node_modules/
+dist/
+*.log
