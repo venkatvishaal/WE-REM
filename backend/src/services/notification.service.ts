@@ -57,7 +57,7 @@ function buildEmailHtml(payload: NotificationPayload): string {
 export async function notifyStatusChange(applicationId: string, companyName: string, jobTitle: string, previousStatus: string, newStatus: string): Promise<void> {
   const labels: Record<string, string> = {
     applied: 'Applied', acknowledged: 'Acknowledged', under_review: 'Under Review',
-    interview: 'Interview', assessment: 'Assessment', offer: 'Offer 🎉', rejected: 'Rejected', withdrawn: 'Withdrawn',
+    interview: 'Interview', assessment: 'Assessment', offer: 'Offer', rejected: 'Rejected', withdrawn: 'Withdrawn',
   };
   const type: NotificationType = newStatus === 'interview' ? 'interview' : newStatus === 'offer' ? 'offer' : newStatus === 'rejected' ? 'rejection' : 'status_change';
   await dispatch({ applicationId, type, title: `${companyName} — ${labels[newStatus] || newStatus}`, body: `Your ${jobTitle} application moved: ${labels[previousStatus] || previousStatus} → ${labels[newStatus] || newStatus}.` });
@@ -112,17 +112,17 @@ export async function findTelegramChatId(): Promise<string | undefined> {
   return last ? String(last.message.chat.id) : undefined;
 }
 
-const ALERT_LABELS: Record<string, [string, string]> = {
-  rejected: ['❌', 'Rejected'], position_filled: ['❌', 'Position closed'], interview: ['🎤', 'Interview'],
-  assessment: ['📝', 'Assessment'], offer: ['🎉', 'Offer'], acknowledged: ['✅', 'Application received'],
-  document_request: ['📎', 'Action needed'], status_change: ['🔄', 'Update'],
+const ALERT_LABELS: Record<string, string> = {
+  rejected: 'Rejected', position_filled: 'Position closed', interview: 'Interview',
+  assessment: 'Assessment', offer: 'Offer', acknowledged: 'Application received',
+  document_request: 'Action needed', status_change: 'Update',
 };
 
 export function jobAlertText(company: string, jobTitle: string, eventType: string, subject: string, receivedAt: string): string {
-  const [emoji, label] = ALERT_LABELS[eventType] || ALERT_LABELS.status_change;
+  const label = ALERT_LABELS[eventType] || ALERT_LABELS.status_change;
   const date = new Date(receivedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
   const subj = subject.length > 120 ? `${subject.slice(0, 117)}…` : subject;
-  return [`${emoji} ${company} — ${label}`, jobTitle !== 'Position Applied' ? jobTitle : '', `"${subj}"`, date]
+  return [`[${label.toUpperCase()}] ${company}`, jobTitle !== 'Position Applied' ? jobTitle : '', `"${subj}"`, date]
     .filter(Boolean)
     .join('\n');
 }

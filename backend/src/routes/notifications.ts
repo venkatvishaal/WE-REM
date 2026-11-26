@@ -37,7 +37,7 @@ router.post('/test-telegram', async (_req: Request, res: Response) => {
       }
       hint = ` Now add TELEGRAM_CHAT_ID=${chatId} to backend/.env and restart the backend.`;
     }
-    const ok = await sendTelegram('✅ Job Tracker alerts are working', chatId);
+    const ok = await sendTelegram('Job Tracker alerts are working', chatId);
     if (!ok) {
       res.status(502).json({ error: 'Telegram did not accept the message. Check the backend log.' });
       return;

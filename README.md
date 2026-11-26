@@ -1,19 +1,19 @@
-# 📊 Job Application Tracker
+# WE-REM: A Unified Platform for Managing Applications for Job Seekers
 
-A personal dashboard that tracks the status of **every job you apply to** — Workday, Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, HackerRank, LinkedIn, company career sites and more. It reads your Gmail, finds every application, acknowledgement, assessment, interview, offer and rejection email, and keeps one up-to-date timeline per application.
+**WE-REM** is a comprehensive, personal application management platform that tracks the status of **every job you apply to** across all platforms — Workday, Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, HackerRank, LinkedIn, direct company career sites, and more. It connects to your Gmail, automatically identifies application confirmations, assessments, interview invites, offers, and rejection notices, and maintains a unified, real-time timeline for every opportunity.
 
 ## Features
 
-- **📧 Gmail sync** — OAuth 2.0 (read-only + send-to-self), incremental sync every 15 minutes, no passwords stored
-- **🔍 Smart parsing** — Detects company, role, requisition ID and event type from any ATS or no-reply sender, including rejections and "position filled" notices hidden in the email body
-- **🗂️ All platforms** — Workday, Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, Zoho Recruit, HirePro, HackerRank and plain company emails
-- **🎤 Interviews** — Interview and assessment invites are tracked with their date and details
-- **⏱️ Response timing** — How long ago you applied, the exact date of each company reply, and how many days it took (including rejections)
-- **🌐 Candidate portal checks** — Some companies never email a rejection; the tracker reads your status on Workday and SmartRecruiters candidate portals you've signed in to (you log in yourself once; passwords are never stored)
-- **📱 Telegram alerts** — A phone message for every new job email: received, assessment, interview, offer, rejection
-- **📊 Dashboard** — Stats, response rate, trend charts, pipeline and status breakdown
-- **📋 Full timeline** — Every email and portal change per application
-- **✏️ Manual control** — Add applications, edit status, add notes
+- **Gmail sync** — OAuth 2.0 (read-only + send-to-self), incremental sync every 15 minutes, no passwords stored
+- **Smart parsing** — Detects company, role, requisition ID and event type from any ATS or no-reply sender, including rejections and "position filled" notices hidden in the email body
+- **All platforms** — Workday, Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, Zoho Recruit, HirePro, HackerRank and plain company emails
+- **Interviews** — Interview and assessment invites are tracked with their date and details
+- **Response timing** — How long ago you applied, the exact date of each company reply, and how many days it took (including rejections)
+- **Candidate portal checks** — Some companies never email a rejection; the tracker reads your status on Workday and SmartRecruiters candidate portals you've signed in to (you log in yourself once; passwords are never stored)
+- **Telegram alerts** — A phone message for every new job email: received, assessment, interview, offer, rejection
+- **Dashboard** — Stats, response rate, trend charts, pipeline and status breakdown
+- **Full timeline** — Every email and portal change per application
+- **Manual control** — Add applications, edit status, add notes
 
 ## Architecture
 

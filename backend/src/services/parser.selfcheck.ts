@@ -122,9 +122,9 @@ const apply = (m: ReturnType<typeof msg>) => {
   // Telegram alert text + flood guard (no network)
   const { jobAlertText, shouldAlert } = require('./notification.service');
   const alert = jobAlertText('HackerRank', 'Customer Experience Engineer I', 'interview', 'You are shortlisted', '2026-11-26T10:00:00Z');
-  assert.strictEqual(alert, '🎤 HackerRank — Interview\nCustomer Experience Engineer I\n"You are shortlisted"\n26 Nov 2026');
-  assert.ok(jobAlertText('Walmart', 'Position Applied', 'rejected', 's', '2026-11-26T10:00:00Z').startsWith('❌ Walmart — Rejected\n"s"'), 'generic title omitted');
-  assert.ok(jobAlertText('Acme', 'Intern', 'acknowledged', 's', '2026-11-26T10:00:00Z').startsWith('✅ Acme — Application received'));
+  assert.strictEqual(alert, '[INTERVIEW] HackerRank\nCustomer Experience Engineer I\n"You are shortlisted"\n26 Nov 2026');
+  assert.ok(jobAlertText('Walmart', 'Position Applied', 'rejected', 's', '2026-11-26T10:00:00Z').startsWith('[REJECTED] Walmart\n"s"'), 'generic title omitted');
+  assert.ok(jobAlertText('Acme', 'Intern', 'acknowledged', 's', '2026-11-26T10:00:00Z').startsWith('[APPLICATION RECEIVED] Acme'));
   const now = Date.parse('2026-11-26T12:00:00Z');
   assert.ok(shouldAlert('2026-11-25T12:00:00Z', now), 'a 1-day-old email alerts');
   assert.ok(!shouldAlert('2026-11-20T12:00:00Z', now), 'a 6-day-old email does not');
