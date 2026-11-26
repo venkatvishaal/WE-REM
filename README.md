@@ -1,5 +1,7 @@
 # WE-REM: A Unified Platform for Managing Applications for Job Seekers
 
+[![CI](https://github.com/venkatvishaal/WE-REM/actions/workflows/ci.yml/badge.svg)](https://github.com/venkatvishaal/WE-REM/actions/workflows/ci.yml)
+
 **WE-REM** is a comprehensive, personal application management platform that tracks the status of **every job you apply to** across all platforms — Workday, Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, HackerRank, LinkedIn, direct company career sites, and more. It connects to your Gmail, automatically identifies application confirmations, assessments, interview invites, offers, and rejection notices, and maintains a unified, real-time timeline for every opportunity.
 
 ## Features
@@ -89,15 +91,39 @@ Create a bot with **@BotFather** (`/newbot`) and set `TELEGRAM_BOT_TOKEN`, `TELE
 
 Set `ENABLE_PORTAL_CHECKS=true` and run `npx playwright install chromium` in `backend`. In **Settings → Company portals**, click **Log in** next to a portal, sign in yourself in the window that opens, then close it. Only that browser session is kept (in `backend/data/portal-browser`). Never enable this on the hosted server: it would hold other people's portal sessions.
 
-## Checks
+## Tests
 
 ```bash
 cd backend
-npx ts-node --transpile-only src/services/parser.selfcheck.ts    # parsing and matching
-npx ts-node --transpile-only src/services/tenancy.selfcheck.ts   # users can't see each other's data
+npm run typecheck
+npm test        # parser self-check + tenancy self-check (users can't see each other's data)
 ```
 
-Both run on an in-memory database and never touch your data or the network.
+Both self-checks run on an in-memory database and never touch your data or the network.
+
+## CI / DevOps
+
+**On every push and pull request** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), two jobs run in parallel:
+
+- `backend`: install → type-check → `npm test` → build
+- `frontend`: install → type-check + build
+
+They need no secrets. A newer push cancels the older run on the same branch.
+
+**Dependency updates** ([`.github/dependabot.yml`](.github/dependabot.yml)): weekly PRs for backend, frontend and GitHub Actions. Minor and patch updates are grouped, and CI tests each PR.
+
+**Deploys** (`render.yaml`): Render deploys `main` only after CI passes (`autoDeployTrigger: checksPass`). It restarts the app if `/api/health` fails.
+
+**One-time GitHub settings** (Settings tab of the repo):
+
+1. **Branches → Add rule for `main`**: require a pull request, require status checks `backend` and `frontend`, and block force pushes.
+2. **Code security**: turn on **Secret scanning** and **Push protection**. GitHub then rejects pushes that contain tokens such as OAuth secrets, bot tokens or database URLs.
+3. **Code security → Code scanning → CodeQL → Default setup**: weekly security scan, plus one on every PR.
+
+**Monitoring and backups**:
+
+- Free uptime alert: an [UptimeRobot](https://uptimerobot.com) monitor on `https://<your-app>.onrender.com/api/health`.
+- Neon keeps restore history. Before risky database changes, click **Branch** in Neon to take a snapshot.
 
 ## API
 

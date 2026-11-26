@@ -5,6 +5,8 @@ services:
     name: job-tracker
     runtime: node
     plan: starter            # free plan sleeps after 15 min idle, which would stop the Gmail sync loop
+    branch: main
+    autoDeployTrigger: checksPass  # deploy only after the GitHub Actions CI checks pass
     buildCommand: cd frontend && npm ci && npm run build && cd ../backend && npm ci && npm run build
     startCommand: cd backend && node dist/index.js
     healthCheckPath: /api/health
