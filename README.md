@@ -1,137 +1,116 @@
-# 📊 Workday Application Tracker
+# 📊 Job Application Tracker
 
-A personal job-application tracking system that automatically monitors your Workday-powered job applications via Gmail.
+A personal dashboard that tracks the status of **every job you apply to** — Workday, Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, HackerRank, LinkedIn, company career sites and more. It reads your Gmail, finds every application, acknowledgement, assessment, interview, offer and rejection email, and keeps one up-to-date timeline per application.
 
 ## Features
 
-- **📧 Gmail Integration** — OAuth 2.0 sync, incremental history API, no passwords stored
-- **🔍 Smart Parsing** — Extracts company, role, requisition ID, and event type from emails
-- **🌐 Portal Verification** — Graceful fallback: REST API → Playwright browser → email-only
-- **📊 Dashboard** — Stats, trend charts, activity feed, status breakdown
-- **🔔 Notifications** — In-app, email-to-self, and desktop browser push
-- **📋 Full Timeline** — Every email event and portal verification tracked per application
-- **✏️ Manual Control** — Add applications manually, edit status, add notes
+- **📧 Gmail sync** — OAuth 2.0 (read-only + send-to-self), incremental sync every 15 minutes, no passwords stored
+- **🔍 Smart parsing** — Detects company, role, requisition ID and event type from any ATS or no-reply sender, including rejections and "position filled" notices hidden in the email body
+- **🗂️ All platforms** — Workday, Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, Zoho Recruit, HirePro, HackerRank and plain company emails
+- **🎤 Interviews** — Interview and assessment invites are tracked with their date and details
+- **⏱️ Response timing** — How long ago you applied, the exact date of each company reply, and how many days it took (including rejections)
+- **🌐 Candidate portal checks** — Some companies never email a rejection; the tracker reads your status on Workday and SmartRecruiters candidate portals you've signed in to (you log in yourself once; passwords are never stored)
+- **📱 Telegram alerts** — A phone message for every new job email: received, assessment, interview, offer, rejection
+- **📊 Dashboard** — Stats, response rate, trend charts, pipeline and status breakdown
+- **📋 Full timeline** — Every email and portal change per application
+- **✏️ Manual control** — Add applications, edit status, add notes
 
 ## Architecture
 
 ```
-Gmail OAuth → Email Ingestion → Parser → Portal Verification → SQLite → REST API → React Dashboard
+Gmail OAuth → Email sync → Parser → SQLite → REST API → React dashboard
+                                      ↑                ↘ Telegram alerts
+              Candidate portals (Playwright, your own session)
 ```
-
-Portal verification fallback chain:
-1. Workday public REST (`/wday/cxs/...`)
-2. Playwright headless browser (opt-in)
-3. Email-only mode (always available)
 
 ## Setup
 
 ### Prerequisites
 - Node.js 20+
-- npm
+- A Google Cloud project with the Gmail API enabled (see below)
 
-### 1. Install dependencies
+### 1. Install
 
 ```bash
-# Backend
 cd backend && npm install
-
-# Frontend
+npx playwright install chromium   # only needed for candidate-portal checks
 cd ../frontend && npm install
 ```
 
-### 2. Configure environment
+### 2. Configure
 
-Copy `.env.example` to `.env` (already done — credentials pre-filled):
+Copy `.env.example` to `backend/.env` and fill in:
 
-```bash
-# The following are already set in .env:
-GMAIL_CLIENT_ID=778309906020-...
-GMAIL_CLIENT_SECRET=GOCSPX-...
-GMAIL_REDIRECT_URI=http://localhost:3001/api/auth/gmail/callback
-```
+| Variable | What it is |
+|----------|------------|
+| `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` | Your Google OAuth client |
+| `GMAIL_REDIRECT_URI` | `http://localhost:3001/api/auth/gmail/callback` |
+| `TOKEN_ENCRYPTION_KEY` | Any random 32-character string |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Optional, for phone alerts (see below) |
 
-> **Important**: Add `http://localhost:3001/api/auth/gmail/callback` to your Google Cloud project's **Authorized redirect URIs** if not already done.
+Never commit `.env` — it is in `.gitignore`.
 
-### 3. Start servers
-
-**Terminal 1 — Backend:**
-```bash
-cd backend
-npm run dev
-```
-
-**Terminal 2 — Frontend:**
-```bash
-cd frontend
-npm run dev
-```
-
-Open [http://localhost:5173](http://localhost:5173)
-
-### 4. Connect Gmail
-
-1. Click **Connect Gmail Account** on the auth screen
-2. Authorize the app in the Google OAuth flow
-3. You'll be redirected back — syncing starts automatically
-
-## Google Cloud Setup
-
-If you need to configure your Google Cloud project:
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com)
-2. Enable the **Gmail API**
-3. Create OAuth 2.0 credentials (Web application type)
-4. Add authorized redirect URI: `http://localhost:3001/api/auth/gmail/callback`
-5. Add your email as a test user under OAuth consent screen
-
-## Optional: Browser Verification
-
-To enable Playwright-based portal verification:
+### 3. Run
 
 ```bash
-# Install Playwright (one-time, ~150MB)
-cd backend
-npx playwright install chromium
+# Terminal 1
+cd backend && npm run dev
 
-# Set in .env
-ENABLE_BROWSER_VERIFICATION=true
+# Terminal 2
+cd frontend && npm run dev
 ```
 
-Then enable "Browser Verification" in Settings.
+Open [http://localhost:5173](http://localhost:5173), click **Connect Gmail Account**, and approve access. The first sync scans your past job emails.
 
-## API Reference
+## Google Cloud setup
+
+1. Open [Google Cloud Console](https://console.cloud.google.com) and enable the **Gmail API**
+2. Configure the OAuth consent screen and add your Gmail address as a **test user**
+3. Create an OAuth client (Web application) with redirect URI `http://localhost:3001/api/auth/gmail/callback`
+
+> While the app is in **Testing** mode, Google expires the sign-in every 7 days — just reconnect Gmail in Settings.
+
+## Telegram alerts (optional)
+
+1. In Telegram, message **@BotFather**, send `/newbot`, and put the token in `TELEGRAM_BOT_TOKEN`
+2. Open your new bot and press **Start**
+3. Restart the backend, then in **Settings → Telegram alerts** click **Send test message**
+4. Add the `TELEGRAM_CHAT_ID=…` it shows to `backend/.env`, restart, and turn the toggle on
+
+Only emails from the last 48 hours trigger alerts, so a full re-sync never floods your phone.
+
+## Candidate portal checks (optional)
+
+In **Settings → Company portals**, click **Log in** next to a portal, sign in yourself in the window that opens, then close it. The tracker keeps only that browser session (in `backend/data/portal-browser`) and checks your application status every 6 hours. Supported: Workday "My Applications" and SmartRecruiters.
+
+## API
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/auth/gmail/url` | Get OAuth URL |
-| GET | `/api/auth/gmail/callback` | OAuth callback |
-| GET | `/api/auth/status` | Auth status |
-| POST | `/api/auth/logout` | Disconnect Gmail |
-| GET | `/api/applications` | List applications (paginated) |
-| POST | `/api/applications` | Create manually |
-| PATCH | `/api/applications/:id` | Update |
-| DELETE | `/api/applications/:id` | Delete |
+| GET | `/api/auth/gmail/url` | OAuth URL |
+| GET | `/api/auth/status` | Gmail connection status |
+| GET / POST | `/api/applications` | List (filter, sort, paginate) / add manually |
+| GET / PATCH / DELETE | `/api/applications/:id` | One application |
 | GET | `/api/applications/:id/timeline` | Timeline events |
-| POST | `/api/applications/:id/notes` | Add note |
-| GET | `/api/notifications` | List notifications |
-| PATCH | `/api/notifications/read-all` | Mark all read |
-| GET | `/api/stats` | Aggregate stats |
-| GET | `/api/stats/trends?days=30` | Time-series data |
-| PATCH | `/api/settings` | Update settings |
-| POST | `/api/monitor/sync-now` | Manual sync trigger |
-| GET | `/api/monitor/status` | Sync health |
+| GET | `/api/stats` | Stats, response rate, responses by type |
+| GET / PATCH | `/api/settings` | Settings |
+| GET | `/api/notifications` | In-app notifications |
+| POST | `/api/notifications/test-telegram` | Send a Telegram test message |
+| GET | `/api/portal/status` | Candidate portal states |
+| POST | `/api/portal/login` | Open a portal sign-in window |
+| POST | `/api/portal/check-now` | Check all portals now |
 
-## Data Storage
+## Data & privacy
 
-- **Database**: `backend/data/tracker.db` (SQLite, WAL mode)
-- **Gmail tokens**: `backend/data/.tokens.enc` (AES-256-GCM encrypted)
-- **No cloud dependencies** — everything runs locally
+Everything runs on your own machine. Nothing below is committed to git:
 
-## Status State Machine
+- `backend/data/tracker.db` — SQLite database of your applications and emails
+- `backend/data/.tokens.enc` — Gmail tokens (AES-256-GCM encrypted)
+- `backend/data/portal-browser/` — candidate portal browser session
+
+## Status flow
 
 ```
-applied → acknowledged → under_review → interview → offer
-                                      ↘ assessment ↗
-                                      ↘ rejected
-                                      ↘ withdrawn
+applied → acknowledged → under_review → assessment → interview → offer
+                                    ↘ rejected / position_filled / withdrawn
 ```
