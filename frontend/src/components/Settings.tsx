@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { Check, Mail, Bell, Shield, Sliders, RefreshCw, Key } from 'lucide-react';
-import { api } from '../api/client';
+import { Check, Mail, Bell, Shield, Sliders, RefreshCw, Key, Send } from 'lucide-react';
+import { api, AuthStatus, signInWithGoogle } from '../api/client';
 import CompanyPortals from './CompanyPortals';
 
 type SettingsMap = Record<string, string>;
@@ -41,20 +41,22 @@ function Toggle({ id, checked, onChange }: { id: string; checked: boolean; onCha
   );
 }
 
-export default function Settings() {
+export default function Settings({ auth }: { auth?: AuthStatus }) {
   const [settings, setSettings] = useState<SettingsMap>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [syncStatus, setSyncStatus] = useState<any>(null);
   const [authStatus, setAuthStatus] = useState<boolean | null>(null);
+  const [telegramConnected, setTelegramConnected] = useState(!!auth?.telegramConnected);
 
   useEffect(() => {
     Promise.all([api.settings.get(), api.monitor.status(), api.auth.status()])
       .then(([s, sync, auth]) => {
         setSettings(s);
         setSyncStatus(sync);
-        setAuthStatus(auth.authenticated);
+        setAuthStatus(auth.gmailConnected && !auth.reconnectNeeded);
+        setTelegramConnected(auth.telegramConnected);
       })
       .finally(() => setLoading(false));
   }, []);
@@ -74,15 +76,42 @@ export default function Settings() {
     }
   };
 
-  const handleConnectGmail = async () => {
-    const { url } = await api.auth.getUrl();
-    window.location.href = url;
-  };
+  const handleConnectGmail = () => signInWithGoogle();
 
   const handleDisconnectGmail = async () => {
-    if (!confirm('Disconnect Gmail connection? Syncing will stop until reconnected.')) return;
-    await api.auth.logout();
+    if (!confirm('Disconnect Gmail? Job Tracker loses Gmail access and stops syncing. Your saved applications stay.')) return;
+    await api.account.disconnectGmail();
     setAuthStatus(false);
+  };
+
+  const handleSignOut = async () => {
+    await api.auth.logout();
+    window.location.href = '/';
+  };
+
+  const handleDeleteAccount = async () => {
+    const typed = prompt('This permanently deletes your account, every saved application and email, and revokes Gmail access. It cannot be undone.\n\nType DELETE to confirm.');
+    if (typed !== 'DELETE') return;
+    await api.account.delete();
+    window.location.href = '/';
+  };
+
+  const connectTelegram = async () => {
+    setTelegramStatus(null);
+    try {
+      const { url } = await api.notifications.telegramLink();
+      window.open(url, '_blank', 'noopener');
+      setTelegramStatus('Press Start in the Telegram chat that opened, then reload this page.');
+    } catch (err: any) {
+      setTelegramStatus(err?.message || 'Could not create a Telegram link');
+    }
+  };
+
+  const disconnectTelegram = async () => {
+    await api.notifications.telegramDisconnect();
+    setTelegramConnected(false);
+    setSetting('notify_telegram', false);
+    setTelegramStatus('Telegram disconnected.');
   };
 
   const [reparsing, setReparsing] = useState(false);
@@ -159,7 +188,7 @@ export default function Settings() {
             {reparsing ? 'Reparsing...' : 'Reparse DB Emails'}
           </button>
           <button className="btn btn-ghost btn-sm" onClick={handleDisconnectGmail} style={{ color: 'var(--error)' }}>
-            Disconnect
+            Disconnect Gmail
           </button>
         </div>
       );
@@ -198,7 +227,7 @@ export default function Settings() {
               <div>
                 <div style={{ fontWeight: 600, color: 'var(--text-primary)', fontSize: 14 }}>Connection Status</div>
                 <div className="text-caption" style={{ color: 'var(--text-secondary)' }}>
-                  {authStatus ? 'Active read-only access to application emails' : 'Not connected'}
+                  {authStatus ? `Read-only access to ${auth?.email || 'your Gmail'}` : 'Not connected'}
                 </div>
               </div>
 
@@ -228,7 +257,7 @@ export default function Settings() {
                   </div>
                 </div>
                 <div className="font-mono text-caption" style={{ color: 'var(--text-muted)' }}>
-                  Cron: {syncStatus.gmailCron || '*/15 * * * *'}
+                  Every {syncStatus.syncEveryMinutes || 15} min
                 </div>
               </div>
             )}
@@ -256,7 +285,7 @@ export default function Settings() {
               />
             </div>
 
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingTop: 'var(--space-3)', borderTop: '1px solid var(--border-subtle)' }}>
+            {auth?.portalChecks && <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingTop: 'var(--space-3)', borderTop: '1px solid var(--border-subtle)' }}>
               <div>
                 <div style={{ fontWeight: 600, color: 'var(--text-primary)', fontSize: 14 }}>Automatic portal checks</div>
                 <div className="text-caption" style={{ color: 'var(--text-secondary)' }}>Every 6 hours, read your status on the company portals you are signed in to</div>
@@ -266,11 +295,11 @@ export default function Settings() {
                 checked={settings.portal_verify_enabled === 'true'}
                 onChange={(v) => setSetting('portal_verify_enabled', v)}
               />
-            </div>
+            </div>}
           </div>
         </div>
 
-        <CompanyPortals />
+        {auth?.portalChecks && <CompanyPortals />}
 
         {/* Section 3: Notifications */}
         <div className="card">
@@ -295,28 +324,25 @@ export default function Settings() {
 
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingTop: 'var(--space-3)', borderTop: '1px solid var(--border-subtle)' }}>
               <div>
-                <div style={{ fontWeight: 600, color: 'var(--text-primary)', fontSize: 14 }}>Email Notifications</div>
-                <div className="text-caption" style={{ color: 'var(--text-secondary)' }}>Send instant email summaries for interview invites or offers</div>
-              </div>
-              <Toggle
-                id="toggle-notify-email"
-                checked={settings.notify_email === 'true'}
-                onChange={(v) => setSetting('notify_email', v)}
-              />
-            </div>
-
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingTop: 'var(--space-3)', borderTop: '1px solid var(--border-subtle)' }}>
-              <div>
                 <div style={{ fontWeight: 600, color: 'var(--text-primary)', fontSize: 14 }}>Telegram alerts</div>
                 <div className="text-caption" style={{ color: 'var(--text-secondary)' }}>
-                  Phone alert for every new job email. Setup: create a bot with @BotFather, put its token in backend/.env as TELEGRAM_BOT_TOKEN, press Start in the bot, then send a test.
+                  {telegramConnected
+                    ? 'Connected. You get a phone message for every new job email.'
+                    : 'Get a phone message for every new job email. Click Connect Telegram, then press Start in the chat that opens.'}
                 </div>
                 {telegramStatus && (
                   <div className="text-caption" style={{ color: 'var(--color-primary)', marginTop: 4 }}>{telegramStatus}</div>
                 )}
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', flexShrink: 0 }}>
-                <button className="btn btn-ghost btn-sm" onClick={testTelegram}>Send test message</button>
+                {telegramConnected ? (
+                  <>
+                    <button className="btn btn-ghost btn-sm" onClick={testTelegram}>Send test message</button>
+                    <button className="btn btn-ghost btn-sm" onClick={disconnectTelegram}>Disconnect</button>
+                  </>
+                ) : (
+                  <button className="btn btn-secondary btn-sm" onClick={connectTelegram}><Send size={14} /> Connect Telegram</button>
+                )}
                 <Toggle
                   id="toggle-notify-telegram"
                   checked={settings.notify_telegram === 'true'}
@@ -332,13 +358,17 @@ export default function Settings() {
           <div className="card-header">
             <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
               <Shield size={18} style={{ color: 'var(--color-primary)' }} />
-              <span className="card-title">Security & Data Privacy</span>
+              <span className="card-title">Account & Privacy</span>
             </div>
           </div>
           <div className="card-body">
             <p className="text-caption" style={{ color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-              Workday Tracker runs locally on your system with OAuth2 read-only tokens. Your tokens are stored locally and encrypted. No application telemetry is transmitted externally.
+              Signed in as <strong>{auth?.email}</strong>. Job Tracker has read-only Gmail access and stores only job emails (first 4 KB of text), encrypted tokens and your applications. <a href="/privacy">Read the privacy note</a>.
             </p>
+            <div style={{ display: 'flex', gap: 'var(--space-2)', marginTop: 'var(--space-3)', flexWrap: 'wrap' }}>
+              <button className="btn btn-secondary btn-sm" onClick={handleSignOut}>Sign out</button>
+              <button className="btn btn-ghost btn-sm" onClick={handleDeleteAccount} style={{ color: 'var(--error)' }}>Delete my data</button>
+            </div>
           </div>
         </div>
       </div>

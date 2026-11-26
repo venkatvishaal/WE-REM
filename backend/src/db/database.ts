@@ -1,7 +1,7 @@
-import initSqlJs, { Database, SqlJsStatic } from 'sql.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as dotenv from 'dotenv';
+import { Pool, types } from 'pg';
 
 const envPaths = [
   path.resolve(__dirname, '../../.env'),
@@ -12,131 +12,83 @@ for (const p of envPaths) {
   if (fs.existsSync(p)) dotenv.config({ path: p });
 }
 
-function resolveDbPath(): string {
-  if (process.env.DB_PATH && fs.existsSync(path.resolve(process.env.DB_PATH))) {
-    return path.resolve(process.env.DB_PATH);
-  }
-  const localDb = path.resolve('./data/tracker.db');
-  if (fs.existsSync(localDb)) return localDb;
-  const backendDb = path.resolve(__dirname, '../../data/tracker.db');
-  if (fs.existsSync(backendDb)) return backendDb;
-  return localDb;
-}
-
-const DB_PATH = resolveDbPath();
 const SCHEMA_PATH = fs.existsSync(path.resolve(__dirname, 'schema.sql'))
   ? path.resolve(__dirname, 'schema.sql')
   : path.resolve(__dirname, '../../src/db/schema.sql');
 
-// Ensure data directory
-const dbDir = path.dirname(DB_PATH);
-if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
+// COUNT(*) is bigint and AVG is numeric; pg returns both as strings by default
+types.setTypeParser(20, (v) => parseInt(v, 10));
+types.setTypeParser(1700, (v) => parseFloat(v));
 
-let _sql: SqlJsStatic | null = null;
-let _db: Database | null = null;
+interface Driver {
+  query(sql: string, params: any[]): Promise<{ rows: any[] }>;
+  exec(sql: string): Promise<unknown>;
+  close(): Promise<void>;
+}
 
-// Flush interval (every 30s) to persist in-memory DB to disk
-let _flushInterval: NodeJS.Timeout | null = null;
+let _driver: Driver | null = null;
 
-export async function initDb(): Promise<Database> {
-  if (_db) return _db;
+/** Neon (or any Postgres) when DATABASE_URL is set; otherwise an embedded PGlite database on disk. */
+export async function initDb(dataDir = process.env.PGLITE_DIR || path.resolve(__dirname, '../../data/pglite')): Promise<void> {
+  if (_driver) return;
 
-  _sql = await initSqlJs();
-
-  // Load existing DB from disk, or create new
-  if (fs.existsSync(DB_PATH)) {
-    const data = fs.readFileSync(DB_PATH);
-    _db = new _sql.Database(data);
-    console.log(`[DB] Loaded from: ${DB_PATH}`);
+  if (process.env.DATABASE_URL) {
+    const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
+    pool.on('connect', (c) => { c.query(`SET TIME ZONE 'UTC'`).catch(() => {}); });
+    _driver = {
+      query: (sql, params) => pool.query(sql, params),
+      exec: (sql) => pool.query(sql),
+      close: () => pool.end(),
+    };
+    console.log('[DB] Connected to Postgres (DATABASE_URL)');
   } else {
-    _db = new _sql.Database();
-    console.log(`[DB] Created new database: ${DB_PATH}`);
+    const { PGlite } = await import('@electric-sql/pglite');
+    const db = dataDir === 'memory://' ? new PGlite() : new PGlite(dataDir);
+    await db.exec(`SET TIME ZONE 'UTC'`);
+    _driver = {
+      query: async (sql, params) => {
+        const r = await db.query(sql, params);
+        // PGlite returns int8 as BigInt; match the pg driver's numbers
+        return { rows: r.rows.map((row: any) => { for (const k in row) if (typeof row[k] === 'bigint') row[k] = Number(row[k]); return row; }) };
+      },
+      exec: (sql) => db.exec(sql),
+      close: () => db.close(),
+    };
+    console.log(`[DB] Embedded PGlite at ${dataDir}`);
   }
 
-  // Run schema (CREATE TABLE IF NOT EXISTS — idempotent)
-  const schema = fs.readFileSync(SCHEMA_PATH, 'utf-8');
-  _db.run(schema);
-
-  // Column migrations (sql.js has no ADD COLUMN IF NOT EXISTS; "duplicate column" means already applied)
-  for (const col of ['first_response_at TEXT', 'last_response_type TEXT', 'last_response_at TEXT']) {
-    try { _db.run(`ALTER TABLE applications ADD COLUMN ${col}`); } catch { /* already exists */ }
-  }
-
-  // Persist to disk immediately after schema init
-  persistDb();
-
-  // Flush every 30 seconds
-  _flushInterval = setInterval(persistDb, 30000);
-
-  return _db;
+  await _driver.exec(fs.readFileSync(SCHEMA_PATH, 'utf-8'));
 }
 
-export function persistDb(): void {
-  if (!_db) return;
-  try {
-    const data = _db.export();
-    // Write-then-rename so a crash or dev-server restart mid-write can't truncate the DB
-    const tmp = `${DB_PATH}.tmp`;
-    fs.writeFileSync(tmp, data);
-    fs.renameSync(tmp, DB_PATH);
-  } catch (err) {
-    console.error('[DB] Failed to persist:', err);
-  }
+export async function closeDb(): Promise<void> {
+  await _driver?.close();
+  _driver = null;
 }
 
-export function getDb(): Database {
-  if (!_db) throw new Error('[DB] Database not initialized. Call initDb() first.');
-  return _db;
+function driver(): Driver {
+  if (!_driver) throw new Error('[DB] Database not initialized. Call initDb() first.');
+  return _driver;
 }
 
-export function closeDb(): void {
-  if (_flushInterval) clearInterval(_flushInterval);
-  if (_db) {
-    persistDb();
-    _db.close();
-    _db = null;
-    console.log('[DB] Closed and flushed to disk');
+/** Turns SQLite-style `?` placeholders into Postgres `$1, $2…`, skipping quoted strings. */
+export function toPgParams(sql: string): string {
+  let n = 0, out = '', quoted = false;
+  for (const ch of sql) {
+    if (ch === "'") quoted = !quoted;
+    out += ch === '?' && !quoted ? `$${++n}` : ch;
   }
+  return out;
 }
 
 // ── Convenience helpers ──────────────────────────────────────────
-export function dbRun(sql: string, params: any[] = []): void {
-  getDb().run(sql, params);
-  // Persist after writes
-  persistDb();
+export async function dbRun(sql: string, params: any[] = []): Promise<void> {
+  await driver().query(toPgParams(sql), params);
 }
 
-export function dbGet<T = Record<string, unknown>>(
-  sql: string,
-  params: any[] = [],
-): T | undefined {
-  const stmt = getDb().prepare(sql);
-  stmt.bind(params);
-  const hasRow = stmt.step();
-  if (!hasRow) { stmt.free(); return undefined; }
-  const row = stmt.getAsObject() as T;
-  stmt.free();
-  return row;
+export async function dbGet<T = Record<string, unknown>>(sql: string, params: any[] = []): Promise<T | undefined> {
+  return (await driver().query(toPgParams(sql), params)).rows[0] as T | undefined;
 }
 
-export function dbAll<T = Record<string, unknown>>(
-  sql: string,
-  params: any[] = [],
-): T[] {
-  const results: T[] = [];
-  const stmt = getDb().prepare(sql);
-  stmt.bind(params);
-  while (stmt.step()) {
-    results.push(stmt.getAsObject() as T);
-  }
-  stmt.free();
-  return results;
-}
-
-// If run directly
-if (require.main === module) {
-  initDb().then(() => {
-    console.log('[DB] Schema initialized successfully');
-    closeDb();
-  });
+export async function dbAll<T = Record<string, unknown>>(sql: string, params: any[] = []): Promise<T[]> {
+  return (await driver().query(toPgParams(sql), params)).rows as T[];
 }

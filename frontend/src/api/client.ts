@@ -6,6 +6,10 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     ...options,
   });
 
+  if (res.status === 401 && !path.startsWith('/auth/')) {
+    // Session ended (signed out elsewhere, account deleted, cookie expired): back to sign-in
+    window.dispatchEvent(new Event('signed-out'));
+  }
   if (!res.ok) {
     const error = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(error.error || `HTTP ${res.status}`);
@@ -105,12 +109,27 @@ export interface TrendPoint {
   rejections: number;
 }
 
+export interface AuthStatus {
+  authenticated: boolean;
+  email: string;
+  gmailConnected: boolean;
+  reconnectNeeded: boolean;
+  telegramConnected: boolean;
+  portalChecks: boolean;
+}
+
 // ── Auth ────────────────────────────────────────────────────────
 export const api = {
   auth: {
-    status: () => request<{ authenticated: boolean }>('/auth/status'),
+    status: () => request<AuthStatus>('/auth/status'),
     getUrl: () => request<{ url: string }>('/auth/gmail/url'),
     logout:  () => request('/auth/logout', { method: 'POST' }),
+  },
+
+  // ── Account ───────────────────────────────────────────────────
+  account: {
+    disconnectGmail: () => request('/account/disconnect-gmail', { method: 'POST' }),
+    delete: () => request('/account', { method: 'DELETE' }),
   },
 
   // ── Applications ─────────────────────────────────────────────
@@ -146,6 +165,8 @@ export const api = {
     markAllRead: () => request('/notifications/read-all', { method: 'PATCH' }),
     clearRead: () => request('/notifications', { method: 'DELETE' }),
     testTelegram: () => request<{ message: string }>('/notifications/test-telegram', { method: 'POST' }),
+    telegramLink: () => request<{ url: string }>('/notifications/telegram/link', { method: 'POST' }),
+    telegramDisconnect: () => request('/notifications/telegram/disconnect', { method: 'POST' }),
   },
 
   // ── Stats ─────────────────────────────────────────────────────
@@ -173,6 +194,12 @@ export const api = {
     syncNow: (full = false) => request(`/monitor/sync-now?full=${full}`, { method: 'POST' }),
     reparse: () => request('/monitor/reparse', { method: 'POST' }),
     status: () =>
-      request<{ isRunning: boolean; lastSync: string | null; lastError: string | null; gmailCron: string }>('/monitor/status'),
+      request<{ isRunning: boolean; lastSync: string | null; lastError: string | null; syncEveryMinutes: number; reconnectNeeded: boolean }>('/monitor/status'),
   },
 };
+
+/** Starts Google sign-in; also used to reconnect Gmail (Google's test mode ends access every 7 days). */
+export async function signInWithGoogle() {
+  const { url } = await api.auth.getUrl();
+  window.location.href = url;
+}

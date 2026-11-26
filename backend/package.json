@@ -10,24 +10,23 @@
     "db:init": "ts-node src/db/database.ts"
   },
   "dependencies": {
+    "@electric-sql/pglite": "^0.6.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.18.3",
     "googleapis": "^140.0.1",
-    "node-cron": "^3.0.3",
-    "nodemailer": "^6.9.13",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.23.1",
     "playwright": "^1.65.1",
-    "sql.js": "^1.12.0",
-    "uuid": "^9.0.1"
+    "sql.js": "^1.12.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^20.11.30",
-    "@types/node-cron": "^3.0.11",
-    "@types/nodemailer": "^6.4.14",
+    "@types/pg": "^8.23.1",
     "@types/sql.js": "^1.4.11",
-    "@types/uuid": "^9.0.8",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.4.3"
   }

@@ -1,17 +1,14 @@
-// Self-check for email parsing + application matching. Uses a throwaway DB file.
+// Self-check for email parsing + application matching. Uses a throwaway in-memory Postgres (PGlite).
 // Run: npx ts-node --transpile-only src/services/parser.selfcheck.ts
 import * as assert from 'assert';
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
-
-const tmpDb = path.join(os.tmpdir(), `tracker-selfcheck-${Date.now()}.db`);
-fs.writeFileSync(tmpDb, '');
-process.env.DB_PATH = tmpDb; // must be set before database.ts is loaded
+process.env.DATABASE_URL = ''; // never touch a real database (an empty value also stops dotenv filling it)
+process.env.TELEGRAM_BOT_TOKEN = '';
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const { initDb, dbAll, closeDb } = require('../db/database');
 const { parseEmail, upsertApplication } = require('./parser.service');
+const { upsertUser } = require('./user.service');
+let userId = '';
 
 let n = 0;
 const msg = (subject: string, sender: string, receivedAt: string, bodyText = '') => ({
@@ -20,11 +17,12 @@ const msg = (subject: string, sender: string, receivedAt: string, bodyText = '')
 const apply = (m: ReturnType<typeof msg>) => {
   const p = parseEmail(m);
   assert.ok(p, `should parse: ${m.subject}`);
-  return upsertApplication(p, m.id);
+  return upsertApplication(userId, p, m.id);
 };
 
 (async () => {
-  await initDb();
+  await initDb('memory://');
+  userId = await upsertUser('selfcheck@example.com');
 
   // Workday ack -> tenant company
   assert.strictEqual(parseEmail(msg('Thank you for Applying', 'GE Aerospace Workday Notifications <geaerospace@myworkday.com>', '2026-01-01T00:00:00Z')).companyName, 'GE Aerospace');
@@ -79,23 +77,23 @@ const apply = (m: ReturnType<typeof msg>) => {
   assert.strictEqual(co('Thank you for your interest in HackerRank || Customer Experience Engineer, L1', 'no-reply@hackerrank.com'), 'HackerRank');
 
   // Same role re-applied 45 days later -> new application
-  const r1 = apply(msg('Exciting News: We have received your Application || Software Development Engineer Intern', 'no-reply@hackerrankcareers.com', '2026-10-05T00:00:00Z', 'Application received for the position of Software Development Engineer Intern.'));
-  const r2 = apply(msg('Exciting News: We have received your Application || Software Development Engineer Intern', 'no-reply@hackerrankcareers.com', '2026-11-20T00:00:00Z', 'Application received for the position of Software Development Engineer Intern.'));
+  const r1 = await apply(msg('Exciting News: We have received your Application || Software Development Engineer Intern', 'no-reply@hackerrankcareers.com', '2026-10-05T00:00:00Z', 'Application received for the position of Software Development Engineer Intern.'));
+  const r2 = await apply(msg('Exciting News: We have received your Application || Software Development Engineer Intern', 'no-reply@hackerrankcareers.com', '2026-11-20T00:00:00Z', 'Application received for the position of Software Development Engineer Intern.'));
   assert.ok(r2.isNew && r2.applicationId !== r1.applicationId, 're-application is a new row');
 
   // Response tracking: ack (day 0) -> assessment (day 5) -> interview (day 12) -> rejection (day 20)
-  const respApp = () => dbAll('SELECT first_response_at f, last_response_type t FROM applications WHERE company_name = ?', ['Globex'])[0] as any;
-  apply(msg('Thank you for applying to Globex', 'Globex Careers <jobs@globex.com>', '2026-03-01T00:00:00Z'));
-  assert.strictEqual(respApp().f, null, 'an ack alone is not a response');
-  assert.strictEqual(respApp().t, null);
-  apply(msg('Globex online assessment invitation', 'Globex Careers <jobs@globex.com>', '2026-03-06T00:00:00Z', 'Please complete the online assessment.'));
-  apply(msg('Interview invitation from Globex', 'Globex Careers <jobs@globex.com>', '2026-03-13T00:00:00Z', 'We would like to invite you to an interview.'));
-  apply(msg('Update on your application', 'Globex Careers <jobs@globex.com>', '2026-03-21T00:00:00Z', 'We have decided not to move forward with your application.'));
-  assert.strictEqual(respApp().f, '2026-03-06T00:00:00Z', 'first reply = assessment date');
-  assert.strictEqual(respApp().t, 'rejected', 'latest reply = rejection');
+  const respApp = async () => (await dbAll('SELECT first_response_at f, last_response_type t FROM applications WHERE company_name = ?', ['Globex']))[0] as any;
+  await apply(msg('Thank you for applying to Globex', 'Globex Careers <jobs@globex.com>', '2026-03-01T00:00:00Z'));
+  assert.strictEqual((await respApp()).f, null, 'an ack alone is not a response');
+  assert.strictEqual((await respApp()).t, null);
+  await apply(msg('Globex online assessment invitation', 'Globex Careers <jobs@globex.com>', '2026-03-06T00:00:00Z', 'Please complete the online assessment.'));
+  await apply(msg('Interview invitation from Globex', 'Globex Careers <jobs@globex.com>', '2026-03-13T00:00:00Z', 'We would like to invite you to an interview.'));
+  await apply(msg('Update on your application', 'Globex Careers <jobs@globex.com>', '2026-03-21T00:00:00Z', 'We have decided not to move forward with your application.'));
+  assert.strictEqual((await respApp()).f, '2026-03-06T00:00:00Z', 'first reply = assessment date');
+  assert.strictEqual((await respApp()).t, 'rejected', 'latest reply = rejection');
   // An older email processed late doesn't overwrite the latest response
-  apply(msg('Interview invitation from Globex', 'Globex Careers <jobs@globex.com>', '2026-03-10T00:00:00Z', 'We would like to invite you to an interview.'));
-  assert.strictEqual(respApp().t, 'rejected');
+  await apply(msg('Interview invitation from Globex', 'Globex Careers <jobs@globex.com>', '2026-03-10T00:00:00Z', 'We would like to invite you to an interview.'));
+  assert.strictEqual((await respApp()).t, 'rejected');
 
   // Candidate-portal links (real shapes from the user's emails)
   const { candidatePortalUrl } = require('../utils/workday-patterns');
@@ -130,26 +128,25 @@ const apply = (m: ReturnType<typeof msg>) => {
   assert.ok(!shouldAlert('2026-11-20T12:00:00Z', now), 'a 6-day-old email does not');
 
   // Two acks from the same company, a week apart, different roles -> two applications
-  const a = apply(msg('Thanks for applying to the Backend Intern at Acme', 'Acme Recruiting <jobs@acme.com>', '2026-01-01T00:00:00Z'));
-  const b = apply(msg('Thanks for applying to the Data Intern at Acme', 'Acme Recruiting <jobs@acme.com>', '2026-01-15T00:00:00Z'));
+  const a = await apply(msg('Thanks for applying to the Backend Intern at Acme', 'Acme Recruiting <jobs@acme.com>', '2026-01-01T00:00:00Z'));
+  const b = await apply(msg('Thanks for applying to the Data Intern at Acme', 'Acme Recruiting <jobs@acme.com>', '2026-01-15T00:00:00Z'));
   assert.ok(a.isNew && b.isNew && a.applicationId !== b.applicationId, 'second role must be a new row');
 
   // Duplicate confirmation the same day -> merged
-  const c = apply(msg('Thank you for your application', 'Acme Recruiting <jobs@acme.com>', '2026-01-15T05:00:00Z'));
+  const c = await apply(msg('Thank you for your application', 'Acme Recruiting <jobs@acme.com>', '2026-01-15T05:00:00Z'));
   assert.strictEqual(c.applicationId, b.applicationId, 'same-day duplicate ack merges');
 
   // Rejection updates the most recently active open application
   const rejection = msg('Update on your application', 'Acme Recruiting <jobs@acme.com>', '2026-01-20T00:00:00Z', 'Unfortunately, we will not be moving forward with your application.');
-  const r = apply(rejection);
+  const r = await apply(rejection);
   assert.strictEqual(r.applicationId, b.applicationId);
   assert.ok(r.statusChanged);
 
   // Reprocessing the same email adds no timeline event
-  const before = dbAll('SELECT id FROM timeline_events').length;
-  apply(rejection);
-  assert.strictEqual(dbAll('SELECT id FROM timeline_events').length, before, 'timeline deduped');
+  const before = (await dbAll('SELECT id FROM timeline_events')).length;
+  await apply(rejection);
+  assert.strictEqual((await dbAll('SELECT id FROM timeline_events')).length, before, 'timeline deduped');
 
-  closeDb();
-  fs.unlinkSync(tmpDb);
+  await closeDb();
   console.log('parser self-check: all passed');
 })().catch((e) => { console.error(e); process.exit(1); });

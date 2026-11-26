@@ -1,0 +1,35 @@
+# Render Blueprint: one web service runs the API and serves the built React app (one domain, simple cookies).
+# Secrets are marked sync: false — Render asks for them when you create the service; they never live in git.
+services:
+  - type: web
+    name: job-tracker
+    runtime: node
+    plan: starter            # free plan sleeps after 15 min idle, which would stop the Gmail sync loop
+    buildCommand: cd frontend && npm ci && npm run build && cd ../backend && npm ci && npm run build
+    startCommand: cd backend && node dist/index.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATABASE_URL          # Neon connection string (with ?sslmode=require)
+        sync: false
+      - key: GMAIL_CLIENT_ID
+        sync: false
+      - key: GMAIL_CLIENT_SECRET
+        sync: false
+      - key: GMAIL_REDIRECT_URI    # https://<your-app>.onrender.com/api/auth/gmail/callback
+        sync: false
+      - key: FRONTEND_URL          # https://<your-app>.onrender.com
+        sync: false
+      - key: TOKEN_ENCRYPTION_KEY  # keep the same value you used locally, or migrated Gmail tokens can't be read
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_BOT_USERNAME # e.g. WE_REMbot (without @)
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        generateValue: true

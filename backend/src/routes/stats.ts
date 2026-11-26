@@ -1,28 +1,25 @@
 import { Router, Request, Response } from 'express';
 import { getStats, getTrends, getTopCompanies, getRecentActivity } from '../services/analytics.service';
+import { ah, uid } from '../middleware/auth';
 
 const router = Router();
 
-// ── GET /api/stats ────────────────────────────────────────────
-router.get('/', (_req: Request, res: Response) => {
-  res.json(getStats());
-});
+router.get('/', ah(async (req: Request, res: Response) => {
+  res.json(await getStats(uid(req)));
+}));
 
-// ── GET /api/stats/trends?days=30 ────────────────────────────
-router.get('/trends', (req: Request, res: Response) => {
-  const days = Math.min(365, Math.max(7, parseInt((req.query.days as string) || '30')));
-  res.json(getTrends(days));
-});
+router.get('/trends', ah(async (req: Request, res: Response) => {
+  const days = Math.min(365, Math.max(7, parseInt((req.query.days as string) || '30') || 30));
+  res.json(await getTrends(uid(req), days));
+}));
 
-// ── GET /api/stats/companies ──────────────────────────────────
-router.get('/companies', (_req: Request, res: Response) => {
-  res.json(getTopCompanies(15));
-});
+router.get('/companies', ah(async (req: Request, res: Response) => {
+  res.json(await getTopCompanies(uid(req), 15));
+}));
 
-// ── GET /api/stats/activity ───────────────────────────────────
-router.get('/activity', (req: Request, res: Response) => {
-  const limit = Math.min(50, Math.max(5, parseInt((req.query.limit as string) || '20')));
-  res.json(getRecentActivity(limit));
-});
+router.get('/activity', ah(async (req: Request, res: Response) => {
+  const limit = Math.min(50, Math.max(5, parseInt((req.query.limit as string) || '20') || 20));
+  res.json(await getRecentActivity(uid(req), limit));
+}));
 
 export default router;
